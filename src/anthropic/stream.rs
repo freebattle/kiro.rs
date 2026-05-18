@@ -489,6 +489,8 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            // input_tokens 报告为未缓存部分，cache_read_input_tokens 为缓存命中部分
+            let reported_input_tokens = (input_tokens - cache_read_tokens).max(0);
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -498,7 +500,7 @@ impl SseStateManager {
                         "stop_sequence": null
                     },
                     "usage": {
-                        "input_tokens": input_tokens,
+                        "input_tokens": reported_input_tokens,
                         "output_tokens": output_tokens,
                         "cache_read_input_tokens": cache_read_tokens,
                         "cache_creation_input_tokens": 0
@@ -634,6 +636,10 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        // input_tokens 报告为未缓存部分，cache_read_input_tokens 为缓存命中部分
+        // 客户端计算总上下文 = input_tokens + cache_read_input_tokens
+        let cache_read = self.cache_read_tokens.min(self.input_tokens);
+        let reported_input_tokens = (self.input_tokens - cache_read).max(0);
         json!({
             "type": "message_start",
             "message": {
@@ -645,9 +651,9 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": reported_input_tokens,
                     "output_tokens": 1,
-                    "cache_read_input_tokens": self.cache_read_tokens,
+                    "cache_read_input_tokens": cache_read,
                     "cache_creation_input_tokens": 0
                 }
             }
@@ -1196,7 +1202,7 @@ impl StreamContext {
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events_with_cache(final_input_tokens, self.output_tokens, self.cache_read_tokens),
+                .generate_final_events_with_cache(final_input_tokens, self.output_tokens, self.cache_read_tokens.min(final_input_tokens)),
         );
         events
     }
@@ -1327,11 +1333,14 @@ impl BufferedStreamContext {
             .unwrap_or(self.estimated_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens
+        // 报告给客户端的 input_tokens 是未缓存部分（总量 - cache_read）
+        let cache_read_tokens = self.inner.cache_read_tokens.min(final_input_tokens);
+        let reported_input_tokens = (final_input_tokens - cache_read_tokens).max(0);
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(reported_input_tokens);
                     }
                 }
             }

@@ -31,6 +31,7 @@ export interface RequestRecord {
   success: boolean
   credits: number
   caller?: string
+  thinkingEffort?: string
 }
 
 export interface RequestLogResponse {

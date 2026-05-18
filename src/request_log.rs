@@ -34,6 +34,9 @@ pub struct RequestRecord {
     /// 调用者名称（多 API Key 时标识来源）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller: Option<String>,
+    /// 思考等级（adaptive 模式下的 effort：high / medium / low）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
 }
 
 struct Inner {

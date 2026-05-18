@@ -331,6 +331,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let thinking_effort = payload.output_config.as_ref().map(|c| c.effort.clone());
+
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -348,6 +350,7 @@ pub async fn post_messages(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
         )
         .await
     } else {
@@ -366,6 +369,7 @@ pub async fn post_messages(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
         ).await
     }
 }
@@ -384,6 +388,7 @@ async fn handle_stream_request(
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, credential_id) = match provider.call_api_stream(request_body).await {
@@ -406,6 +411,7 @@ async fn handle_stream_request(
                     success: false,
                     credits: 0.0,
                     caller: caller_name,
+                    thinking_effort,
                 });
             });
             return map_provider_error(e);
@@ -419,7 +425,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流（带请求记录）
-    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name);
+    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort);
 
     // 返回 SSE 响应
     Response::builder()
@@ -453,6 +459,7 @@ fn create_sse_stream(
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -465,8 +472,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)| async move {
             if finished {
                 return None;
             }
@@ -509,7 +516,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, got_first_token, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, got_first_token, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -533,7 +540,7 @@ fn create_sse_stream(
                                     model,
                                     input_tokens: final_input_tokens,
                                     output_tokens,
-                                    cache_read_tokens,
+                                    cache_read_tokens: cache_read_tokens.min(final_input_tokens),
                                     ttft_ms,
                                     duration_ms,
                                     timestamp: now_ms(),
@@ -542,9 +549,10 @@ fn create_sse_stream(
                                     success: false,
                                     credits,
                                     caller: caller_name,
+                                    thinking_effort,
                                 });
                             });
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -567,7 +575,7 @@ fn create_sse_stream(
                                     model,
                                     input_tokens: final_input_tokens,
                                     output_tokens,
-                                    cache_read_tokens,
+                                    cache_read_tokens: cache_read_tokens.min(final_input_tokens),
                                     ttft_ms,
                                     duration_ms,
                                     timestamp: now_ms(),
@@ -576,9 +584,10 @@ fn create_sse_stream(
                                     success: true,
                                     credits,
                                     caller: caller_name,
+                                    thinking_effort,
                                 });
                             });
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)))
                         }
                     }
                 }
@@ -586,7 +595,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)))
                 }
             }
         },
@@ -612,6 +621,7 @@ async fn handle_non_stream_request(
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, credential_id) = match provider.call_api(request_body).await {
@@ -633,6 +643,7 @@ async fn handle_non_stream_request(
                     success: false,
                     credits: 0.0,
                     caller: caller_name,
+                    thinking_effort,
                 });
             });
             return map_provider_error(e);
@@ -808,7 +819,7 @@ async fn handle_non_stream_request(
                 model: model_owned,
                 input_tokens: final_input_tokens,
                 output_tokens,
-                cache_read_tokens,
+                cache_read_tokens: cache_read_tokens.min(final_input_tokens),
                 ttft_ms: None,
                 duration_ms,
                 timestamp: now_ms(),
@@ -817,6 +828,7 @@ async fn handle_non_stream_request(
                 success: true,
                 credits,
                 caller: caller_name,
+                thinking_effort,
             });
         });
     }
@@ -831,9 +843,9 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
+            "input_tokens": (final_input_tokens - cache_read_tokens.min(final_input_tokens)).max(0),
             "output_tokens": output_tokens,
-            "cache_read_input_tokens": cache_read_tokens,
+            "cache_read_input_tokens": cache_read_tokens.min(final_input_tokens),
             "cache_creation_input_tokens": 0
         }
     });
@@ -844,6 +856,7 @@ async fn handle_non_stream_request(
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
+/// - sonnet 4.6 / opus 4.6 / opus 4.7：覆写为 adaptive 类型，支持 output_config.effort
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -852,14 +865,12 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    // adaptive 模式：sonnet 4.6、opus 4.6、opus 4.7
+    let is_adaptive = (model_lower.contains("sonnet") && (model_lower.contains("4-6") || model_lower.contains("4.6")))
+        || (model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6")))
+        || (model_lower.contains("opus") && (model_lower.contains("4-7") || model_lower.contains("4.7")));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_adaptive { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -871,11 +882,15 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
+
+    if is_adaptive {
+        // 优先保留客户端传入的 effort，未传时默认 "high"
+        let effort = payload
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.clone())
+            .unwrap_or_else(|| "high".to_string());
+        payload.output_config = Some(OutputConfig { effort });
     }
 }
 
@@ -1036,6 +1051,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let thinking_effort = payload.output_config.as_ref().map(|c| c.effort.clone());
+
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -1053,6 +1070,7 @@ pub async fn post_messages_cc(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
         )
         .await
     } else {
@@ -1071,6 +1089,7 @@ pub async fn post_messages_cc(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
         ).await
     }
 }
@@ -1092,6 +1111,7 @@ async fn handle_stream_request_buffered(
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, credential_id) = match provider.call_api_stream(request_body).await {
@@ -1113,6 +1133,7 @@ async fn handle_stream_request_buffered(
                     success: false,
                     credits: 0.0,
                     caller: caller_name,
+                    thinking_effort,
                 });
             });
             return map_provider_error(e);
@@ -1123,7 +1144,7 @@ async fn handle_stream_request_buffered(
     let ctx = BufferedStreamContext::new_with_start(model, estimated_input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, start_time);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name);
+    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1154,6 +1175,7 @@ fn create_buffered_sse_stream(
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1173,8 +1195,9 @@ fn create_buffered_sse_stream(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)| async move {
             if finished {
                 return None;
             }
@@ -1188,7 +1211,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)));
                     }
 
                     // 然后处理数据流
@@ -1234,7 +1257,7 @@ fn create_buffered_sse_stream(
                                         model,
                                         input_tokens: final_input_tokens,
                                         output_tokens,
-                                        cache_read_tokens,
+                                        cache_read_tokens: cache_read_tokens.min(final_input_tokens),
                                         ttft_ms,
                                         duration_ms,
                                         timestamp: now_ms(),
@@ -1243,9 +1266,10 @@ fn create_buffered_sse_stream(
                                         success: false,
                                         credits,
                                         caller: caller_name,
+                                        thinking_effort: thinking_effort.clone(),
                                     });
                                 });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)));
                             }
                             None => {
                                 // 流结束
@@ -1267,7 +1291,7 @@ fn create_buffered_sse_stream(
                                         model,
                                         input_tokens: final_input_tokens,
                                         output_tokens,
-                                        cache_read_tokens,
+                                        cache_read_tokens: cache_read_tokens.min(final_input_tokens),
                                         ttft_ms,
                                         duration_ms,
                                         timestamp: now_ms(),
@@ -1276,9 +1300,10 @@ fn create_buffered_sse_stream(
                                         success: true,
                                         credits,
                                         caller: caller_name,
+                                        thinking_effort,
                                     });
                                 });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)));
                             }
                         }
                     }

@@ -181,6 +181,11 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                       </td>
                       <td className="p-3 whitespace-nowrap font-mono text-xs">
                         {shortenModel(record.model)}
+                        {record.thinkingEffort && (
+                          <Badge variant="outline" className="ml-1 text-xs">
+                            {record.thinkingEffort}
+                          </Badge>
+                        )}
                       </td>
                       <td className="p-3 text-right tabular-nums">{formatTokenCount(record.inputTokens - record.cacheReadTokens)}</td>
                       <td className="p-3 text-right tabular-nums">{formatTokenCount(record.outputTokens)}</td>
