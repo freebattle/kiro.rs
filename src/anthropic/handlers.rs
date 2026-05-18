@@ -6,6 +6,7 @@ use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::request_log::{RequestLogStore, RequestRecord};
 use crate::token;
 use axum::{
     Json as JsonExtractor,
@@ -17,15 +18,22 @@ use axum::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
-use super::middleware::AppState;
+use super::middleware::{AppState, CallerIdentity};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -74,6 +82,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1778112000, // May 7, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1778112000, // May 7, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
@@ -177,8 +203,11 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<CallerIdentity>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let caller_name = caller.map(|c| c.0.name);
+    let start_time = Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -290,12 +319,25 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.request_log.clone(),
+            start_time,
+            caller_name,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.request_log.clone(),
+            start_time,
+            caller_name,
+        ).await
     }
 }
 
@@ -307,21 +349,44 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_log: RequestLogStore,
+    start_time: Instant,
+    caller_name: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let log = request_log.clone();
+            let model_owned = model.to_string();
+            tokio::spawn(async move {
+                log.push(RequestRecord {
+                    model: model_owned,
+                    input_tokens,
+                    output_tokens: 0,
+                    ttft_ms: None,
+                    duration_ms,
+                    timestamp: now_ms(),
+                    stream: true,
+                    credential_id: None,
+                    success: false,
+                    credits: 0.0,
+                    caller: caller_name,
+                });
+            });
+            return map_provider_error(e);
+        }
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking_and_start(model, input_tokens, thinking_enabled, tool_name_map, start_time);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    // 创建 SSE 流（带请求记录）
+    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, credential_id, start_time, caller_name);
 
     // 返回 SSE 响应
     Response::builder()
@@ -346,6 +411,12 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    request_log: RequestLogStore,
+    model: String,
+    input_tokens: i32,
+    credential_id: u64,
+    start_time: Instant,
+    caller_name: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -358,8 +429,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, credential_id, start_time, caller_name),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, credential_id, start_time, caller_name)| async move {
             if finished {
                 return None;
             }
@@ -376,10 +447,16 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut got_first_token = first_token_received;
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            if !got_first_token {
+                                                if matches!(&event, Event::AssistantResponse(_)) {
+                                                    got_first_token = true;
+                                                }
+                                            }
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -396,26 +473,68 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, got_first_token, request_log, model, input_tokens, credential_id, start_time, caller_name)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            let output_tokens = ctx.output_tokens();
+                            let ttft_ms = ctx.ttft_ms();
+                            let credits = ctx.credits();
+                            let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            // 异步记录
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            tokio::spawn(async move {
+                                request_log.push(RequestRecord {
+                                    model,
+                                    input_tokens: final_input_tokens,
+                                    output_tokens,
+                                    ttft_ms,
+                                    duration_ms,
+                                    timestamp: now_ms(),
+                                    stream: true,
+                                    credential_id: Some(credential_id),
+                                    success: false,
+                                    credits,
+                                    caller: caller_name,
+                                });
+                            });
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, start_time, None)))
                         }
                         None => {
                             // 流结束，发送最终事件
+                            let output_tokens = ctx.output_tokens();
+                            let ttft_ms = ctx.ttft_ms();
+                            let credits = ctx.credits();
+                            let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            // 异步记录
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            tokio::spawn(async move {
+                                request_log.push(RequestRecord {
+                                    model,
+                                    input_tokens: final_input_tokens,
+                                    output_tokens,
+                                    ttft_ms,
+                                    duration_ms,
+                                    timestamp: now_ms(),
+                                    stream: true,
+                                    credential_id: Some(credential_id),
+                                    success: true,
+                                    credits,
+                                    caller: caller_name,
+                                });
+                            });
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, start_time, None)))
                         }
                     }
                 }
@@ -423,7 +542,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, credential_id, start_time, caller_name)))
                 }
             }
         },
@@ -443,11 +562,33 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_log: RequestLogStore,
+    start_time: Instant,
+    caller_name: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (response, credential_id) = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let model_owned = model.to_string();
+            tokio::spawn(async move {
+                request_log.push(RequestRecord {
+                    model: model_owned,
+                    input_tokens,
+                    output_tokens: 0,
+                    ttft_ms: None,
+                    duration_ms,
+                    timestamp: now_ms(),
+                    stream: false,
+                    credential_id: None,
+                    success: false,
+                    credits: 0.0,
+                    caller: caller_name,
+                });
+            });
+            return map_provider_error(e);
+        }
     };
 
     // 读取响应体
@@ -478,6 +619,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut credits: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -551,6 +693,9 @@ async fn handle_non_stream_request(
                                 stop_reason = "max_tokens".to_string();
                             }
                         }
+                        Event::Metering(metering) => {
+                            credits += metering.usage;
+                        }
                         _ => {}
                     }
                 }
@@ -601,6 +746,27 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+
+    // 异步记录请求
+    {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let model_owned = model.to_string();
+        tokio::spawn(async move {
+            request_log.push(RequestRecord {
+                model: model_owned,
+                input_tokens: final_input_tokens,
+                output_tokens,
+                ttft_ms: None,
+                duration_ms,
+                timestamp: now_ms(),
+                stream: false,
+                credential_id: Some(credential_id),
+                success: true,
+                credits,
+                caller: caller_name,
+            });
+        });
+    }
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -689,8 +855,11 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<CallerIdentity>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let caller_name = caller.map(|c| c.0.name);
+    let start_time = Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -803,12 +972,25 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.request_log.clone(),
+            start_time,
+            caller_name,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.request_log.clone(),
+            start_time,
+            caller_name,
+        ).await
     }
 }
 
@@ -823,18 +1005,40 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_log: RequestLogStore,
+    start_time: Instant,
+    caller_name: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let model_owned = model.to_string();
+            tokio::spawn(async move {
+                request_log.push(RequestRecord {
+                    model: model_owned,
+                    input_tokens: estimated_input_tokens,
+                    output_tokens: 0,
+                    ttft_ms: None,
+                    duration_ms,
+                    timestamp: now_ms(),
+                    stream: true,
+                    credential_id: None,
+                    success: false,
+                    credits: 0.0,
+                    caller: caller_name,
+                });
+            });
+            return map_provider_error(e);
+        }
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new_with_start(model, estimated_input_tokens, thinking_enabled, tool_name_map, start_time);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, credential_id, start_time, caller_name);
 
     // 返回 SSE 响应
     Response::builder()
@@ -856,6 +1060,12 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    request_log: RequestLogStore,
+    model: String,
+    input_tokens: i32,
+    credential_id: u64,
+    start_time: Instant,
+    caller_name: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -866,8 +1076,14 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            request_log,
+            model,
+            input_tokens,
+            credential_id,
+            start_time,
+            caller_name,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, credential_id, start_time, caller_name)| async move {
             if finished {
                 return None;
             }
@@ -875,14 +1091,13 @@ fn create_buffered_sse_stream(
             loop {
                 tokio::select! {
                     // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
                     biased;
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, credential_id, start_time, caller_name)));
                     }
 
                     // 然后处理数据流
@@ -898,7 +1113,6 @@ fn create_buffered_sse_stream(
                                     match result {
                                         Ok(frame) => {
                                             if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
                                             }
                                         }
@@ -911,22 +1125,61 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                let output_tokens = ctx.output_tokens();
+                                let ttft_ms = ctx.ttft_ms();
+                                let credits = ctx.credits();
+                                let final_input_tokens = ctx.final_input_tokens();
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                let duration_ms = start_time.elapsed().as_millis() as u64;
+                                tokio::spawn(async move {
+                                    request_log.push(RequestRecord {
+                                        model,
+                                        input_tokens: final_input_tokens,
+                                        output_tokens,
+                                        ttft_ms,
+                                        duration_ms,
+                                        timestamp: now_ms(),
+                                        stream: true,
+                                        credential_id: Some(credential_id),
+                                        success: false,
+                                        credits,
+                                        caller: caller_name,
+                                    });
+                                });
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, start_time, None)));
                             }
                             None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                // 流结束
+                                let output_tokens = ctx.output_tokens();
+                                let ttft_ms = ctx.ttft_ms();
+                                let credits = ctx.credits();
+                                let final_input_tokens = ctx.final_input_tokens();
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                let duration_ms = start_time.elapsed().as_millis() as u64;
+                                tokio::spawn(async move {
+                                    request_log.push(RequestRecord {
+                                        model,
+                                        input_tokens: final_input_tokens,
+                                        output_tokens,
+                                        ttft_ms,
+                                        duration_ms,
+                                        timestamp: now_ms(),
+                                        stream: true,
+                                        credential_id: Some(credential_id),
+                                        success: true,
+                                        credits,
+                                        caller: caller_name,
+                                    });
+                                });
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, start_time, None)));
                             }
                         }
                     }

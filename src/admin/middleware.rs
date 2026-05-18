@@ -13,6 +13,8 @@ use axum::{
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use crate::common::auth;
+use crate::request_log::RequestLogStore;
+use crate::usage_stats::UsageStatsStore;
 
 /// Admin API 共享状态
 #[derive(Clone)]
@@ -21,13 +23,19 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 请求记录存储
+    pub request_log: RequestLogStore,
+    /// 用量统计存储
+    pub usage_stats: UsageStatsStore,
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    pub fn new(admin_api_key: impl Into<String>, service: AdminService, request_log: RequestLogStore, usage_stats: UsageStatsStore) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            request_log,
+            usage_stats,
         }
     }
 }

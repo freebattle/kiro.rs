@@ -12,29 +12,49 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::ApiKeyEntry;
+use crate::request_log::RequestLogStore;
 
 use super::types::ErrorResponse;
+
+/// 调用者身份（通过请求扩展传递）
+#[derive(Clone, Debug)]
+pub struct CallerIdentity {
+    pub name: String,
+}
 
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
+    /// 主 API 密钥
     pub api_key: String,
+    /// 多 API Key 列表（可选）
+    pub api_keys: Vec<ApiKeyEntry>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 请求记录存储
+    pub request_log: RequestLogStore,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool, request_log: RequestLogStore) -> Self {
         Self {
             api_key: api_key.into(),
+            api_keys: Vec::new(),
             kiro_provider: None,
             extract_thinking,
+            request_log,
         }
+    }
+
+    /// 设置多 API Key 列表
+    pub fn with_api_keys(mut self, api_keys: Vec<ApiKeyEntry>) -> Self {
+        self.api_keys = api_keys;
+        self
     }
 
     /// 设置 KiroProvider
@@ -47,16 +67,36 @@ impl AppState {
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
+    let key = match auth::extract_api_key(&request) {
+        Some(k) => k,
+        None => {
             let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+        }
+    };
+
+    // 先检查多 key 列表
+    if !state.api_keys.is_empty() {
+        for entry in &state.api_keys {
+            if auth::constant_time_eq(&key, &entry.key) {
+                request.extensions_mut().insert(CallerIdentity {
+                    name: entry.name.clone(),
+                });
+                return next.run(request).await;
+            }
         }
     }
+
+    // 回退到主 api_key
+    if auth::constant_time_eq(&key, &state.api_key) {
+        return next.run(request).await;
+    }
+
+    let error = ErrorResponse::authentication_error();
+    (StatusCode::UNAUTHORIZED, Json(error)).into_response()
 }
 
 /// CORS 中间件层

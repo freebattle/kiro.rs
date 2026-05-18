@@ -17,6 +17,13 @@ impl Default for TlsBackend {
     }
 }
 
+/// 多 API Key 配置项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyEntry {
+    pub key: String,
+    pub name: String,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +55,11 @@ pub struct Config {
 
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// 多 API Key 配置（可选，用于区分不同调用者）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<ApiKeyEntry>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -170,6 +182,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            api_keys: Vec::new(),
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),

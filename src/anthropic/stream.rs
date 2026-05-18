@@ -542,15 +542,33 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 首字时间（从请求开始到第一个 AssistantResponse 事件的时间）
+    ttft: Option<std::time::Instant>,
+    /// 请求开始时间（用于计算 TTFT）
+    request_start: std::time::Instant,
+    /// 累计 credits（从 meteringEvent 提取）
+    pub credits: f64,
 }
 
 impl StreamContext {
     /// 创建启用thinking的StreamContext
+    #[allow(dead_code)]
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_thinking_and_start(model, input_tokens, thinking_enabled, tool_name_map, std::time::Instant::now())
+    }
+
+    /// 创建启用thinking的StreamContext（指定请求开始时间）
+    pub fn new_with_thinking_and_start(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        request_start: std::time::Instant,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -568,7 +586,32 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            ttft: None,
+            request_start,
+            credits: 0.0,
         }
+    }
+
+    /// 记录首字时间
+    pub fn mark_first_token(&mut self) {
+        if self.ttft.is_none() {
+            self.ttft = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 获取首字耗时（毫秒）
+    pub fn ttft_ms(&self) -> Option<u64> {
+        self.ttft.map(|t| t.duration_since(self.request_start).as_millis() as u64)
+    }
+
+    /// 获取输出 tokens
+    pub fn output_tokens(&self) -> i32 {
+        self.output_tokens
+    }
+
+    /// 获取累计 credits
+    pub fn credits(&self) -> f64 {
+        self.credits
     }
 
     /// 生成 message_start 事件
@@ -633,8 +676,14 @@ impl StreamContext {
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
-            Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::AssistantResponse(resp) => {
+                self.mark_first_token();
+                self.process_assistant_response(&resp.content)
+            }
+            Event::ToolUse(tool_use) => {
+                self.mark_first_token();
+                self.process_tool_use(tool_use)
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -652,6 +701,10 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                self.credits += metering.usage;
                 Vec::new()
             }
             Event::Error {
@@ -1152,6 +1205,7 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
+    #[allow(dead_code)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
@@ -1160,6 +1214,24 @@ impl BufferedStreamContext {
     ) -> Self {
         let inner =
             StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        Self {
+            inner,
+            event_buffer: Vec::new(),
+            estimated_input_tokens,
+            initial_events_generated: false,
+        }
+    }
+
+    /// 创建缓冲流上下文（指定请求开始时间）
+    pub fn new_with_start(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        request_start: std::time::Instant,
+    ) -> Self {
+        let inner =
+            StreamContext::new_with_thinking_and_start(model, estimated_input_tokens, thinking_enabled, tool_name_map, request_start);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1182,6 +1254,26 @@ impl BufferedStreamContext {
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
         self.event_buffer.extend(events);
+    }
+
+    /// 获取输出 tokens
+    pub fn output_tokens(&self) -> i32 {
+        self.inner.output_tokens()
+    }
+
+    /// 获取累计 credits
+    pub fn credits(&self) -> f64 {
+        self.inner.credits()
+    }
+
+    /// 获取首字耗时（毫秒）
+    pub fn ttft_ms(&self) -> Option<u64> {
+        self.inner.ttft_ms()
+    }
+
+    /// 获取最终的 input_tokens（优先使用 contextUsageEvent 的实际值）
+    pub fn final_input_tokens(&self) -> i32 {
+        self.inner.context_input_tokens.unwrap_or(self.estimated_input_tokens)
     }
 
     /// 完成流处理并返回所有事件

@@ -5,7 +5,9 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+pub mod request_log;
 pub mod token;
+pub mod usage_stats;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +19,8 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use request_log::RequestLogStore;
+use usage_stats::UsageStatsStore;
 
 #[tokio::main]
 async fn main() {
@@ -157,11 +161,35 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 创建请求记录存储
+    let request_log = RequestLogStore::new();
+
+    // 创建用量统计存储
+    let usage_stats = UsageStatsStore::new("./data/usage_stats");
+    usage_stats.spawn_flush_task();
+
+    // 关联用量统计到请求记录
+    let request_log = request_log.with_usage_stats(usage_stats.clone());
+
+    // 启动定时清理任务（每小时清理非当天数据）
+    {
+        let log_clone = request_log.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                log_clone.cleanup_old();
+            }
+        });
+    }
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
+        config.api_keys.clone(),
         Some(kiro_provider),
         config.extract_thinking,
+        request_log.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -179,7 +207,7 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state = admin::AdminState::new(admin_key, admin_service, request_log.clone(), usage_stats.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -199,6 +227,10 @@ async fn main() {
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    if !config.api_keys.is_empty() {
+        tracing::info!("已配置 {} 个调用者 API Key: {}", config.api_keys.len(),
+            config.api_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(", "));
+    }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");

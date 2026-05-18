@@ -2,6 +2,10 @@
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKeys": [
+    { "key": "sk-user-alice-abc123", "name": "alice" },
+    { "key": "sk-user-bob-def456", "name": "bob" }
+  ],
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
