@@ -11,8 +11,10 @@ use axum::{
 };
 
 use crate::common::auth;
+use crate::debug_log::OptionalDebugLogger;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::ApiKeyEntry;
+use crate::prompt_cache::PromptCacheTracker;
 use crate::request_log::RequestLogStore;
 
 use super::types::ErrorResponse;
@@ -37,6 +39,10 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 请求记录存储
     pub request_log: RequestLogStore,
+    /// Prompt Cache 模拟追踪器
+    pub prompt_cache: Arc<PromptCacheTracker>,
+    /// 调试日志记录器
+    pub debug_logger: OptionalDebugLogger,
 }
 
 impl AppState {
@@ -48,12 +54,20 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             request_log,
+            prompt_cache: Arc::new(PromptCacheTracker::new()),
+            debug_logger: OptionalDebugLogger::none(),
         }
     }
 
     /// 设置多 API Key 列表
     pub fn with_api_keys(mut self, api_keys: Vec<ApiKeyEntry>) -> Self {
         self.api_keys = api_keys;
+        self
+    }
+
+    /// 设置调试日志记录器
+    pub fn with_debug_logger(mut self, logger: OptionalDebugLogger) -> Self {
+        self.debug_logger = logger;
         self
     }
 

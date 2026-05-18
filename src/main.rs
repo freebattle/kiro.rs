@@ -2,9 +2,11 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod debug_log;
 mod http_client;
 mod kiro;
 mod model;
+pub mod prompt_cache;
 pub mod request_log;
 pub mod token;
 pub mod usage_stats;
@@ -13,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
+use debug_log::{DebugLogger, OptionalDebugLogger};
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -171,6 +174,15 @@ async fn main() {
     // 关联用量统计到请求记录
     let request_log = request_log.with_usage_stats(usage_stats.clone());
 
+    // 初始化调试日志（如果配置了 debug_log_dir）
+    let debug_logger = match &config.debug_log_dir {
+        Some(dir) => {
+            tracing::info!("调试日志已启用，目录: {}", dir);
+            OptionalDebugLogger::some(DebugLogger::new(dir))
+        }
+        None => OptionalDebugLogger::none(),
+    };
+
     // 启动定时清理任务（每小时清理非当天数据）
     {
         let log_clone = request_log.clone();
@@ -190,6 +202,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         request_log.clone(),
+        debug_logger,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

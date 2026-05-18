@@ -17,6 +17,8 @@ pub struct ModelUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     #[serde(default)]
+    pub cache_read_tokens: i64,
+    #[serde(default)]
     pub credits: f64,
 }
 
@@ -51,7 +53,7 @@ impl UsageStatsStore {
         }
     }
 
-    pub fn record(&self, credential_id: u64, model: &str, input_tokens: i32, output_tokens: i32, credits: f64, caller: Option<&str>) {
+    pub fn record(&self, credential_id: u64, model: &str, input_tokens: i32, output_tokens: i32, cache_read_tokens: i32, credits: f64, caller: Option<&str>) {
         let month = current_month();
         let mut data = self.inner.lock();
         if data.month != month {
@@ -63,6 +65,7 @@ impl UsageStatsStore {
         usage.requests += 1;
         usage.input_tokens += input_tokens as i64;
         usage.output_tokens += output_tokens as i64;
+        usage.cache_read_tokens += cache_read_tokens as i64;
         usage.credits += credits;
 
         if let Some(name) = caller {
@@ -71,6 +74,7 @@ impl UsageStatsStore {
             caller_usage.requests += 1;
             caller_usage.input_tokens += input_tokens as i64;
             caller_usage.output_tokens += output_tokens as i64;
+            caller_usage.cache_read_tokens += cache_read_tokens as i64;
             caller_usage.credits += credits;
         }
     }

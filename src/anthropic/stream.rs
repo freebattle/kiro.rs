@@ -454,10 +454,21 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
+    #[allow(dead_code)]
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+    ) -> Vec<SseEvent> {
+        self.generate_final_events_with_cache(input_tokens, output_tokens, 0)
+    }
+
+    /// 生成最终事件序列（含缓存信息）
+    pub fn generate_final_events_with_cache(
+        &mut self,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -488,7 +499,9 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_tokens,
+                        "cache_creation_input_tokens": 0
                     }
                 }),
             ));
@@ -523,6 +536,8 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 模拟的缓存读取 tokens
+    pub cache_read_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -556,16 +571,18 @@ impl StreamContext {
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
+        cache_read_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        Self::new_with_thinking_and_start(model, input_tokens, thinking_enabled, tool_name_map, std::time::Instant::now())
+        Self::new_with_thinking_and_start(model, input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, std::time::Instant::now())
     }
 
     /// 创建启用thinking的StreamContext（指定请求开始时间）
     pub fn new_with_thinking_and_start(
         model: impl Into<String>,
         input_tokens: i32,
+        cache_read_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
         request_start: std::time::Instant,
@@ -577,6 +594,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            cache_read_tokens,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -628,7 +646,9 @@ impl StreamContext {
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": self.cache_read_tokens,
+                    "cache_creation_input_tokens": 0
                 }
             }
         })
@@ -1176,7 +1196,7 @@ impl StreamContext {
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events_with_cache(final_input_tokens, self.output_tokens, self.cache_read_tokens),
         );
         events
     }
@@ -1209,11 +1229,12 @@ impl BufferedStreamContext {
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
+        cache_read_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+            StreamContext::new_with_thinking(model, estimated_input_tokens, cache_read_tokens, thinking_enabled, tool_name_map);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1226,12 +1247,13 @@ impl BufferedStreamContext {
     pub fn new_with_start(
         model: impl Into<String>,
         estimated_input_tokens: i32,
+        cache_read_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
         request_start: std::time::Instant,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking_and_start(model, estimated_input_tokens, thinking_enabled, tool_name_map, request_start);
+            StreamContext::new_with_thinking_and_start(model, estimated_input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, request_start);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1274,6 +1296,10 @@ impl BufferedStreamContext {
     /// 获取最终的 input_tokens（优先使用 contextUsageEvent 的实际值）
     pub fn final_input_tokens(&self) -> i32 {
         self.inner.context_input_tokens.unwrap_or(self.estimated_input_tokens)
+    }
+
+    pub fn has_context_input_tokens(&self) -> bool {
+        self.inner.context_input_tokens.is_some()
     }
 
     /// 完成流处理并返回所有事件
@@ -1391,7 +1417,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, false, map);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1415,7 +1441,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, false, HashMap::new());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1476,7 +1502,7 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1683,7 +1709,7 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1735,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1755,7 +1781,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1784,7 +1810,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1816,7 +1842,7 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1840,7 +1866,7 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events =
@@ -1893,7 +1919,7 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1912,7 +1938,7 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1930,7 +1956,7 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1950,7 +1976,7 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1979,7 +2005,7 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2034,7 +2060,7 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2055,7 +2081,7 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, 0, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();

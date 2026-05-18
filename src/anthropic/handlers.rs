@@ -27,6 +27,9 @@ use super::middleware::{AppState, CallerIdentity};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use crate::prompt_cache;
+use crate::prompt_cache::PromptCacheTracker;
+use std::sync::Arc;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -293,6 +296,24 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 调试日志：记录原始请求和转换后的请求
+    if state.debug_logger.is_enabled() {
+        let anthropic_body = serde_json::to_string_pretty(&payload).unwrap_or_default();
+        state.debug_logger.log_request(
+            &Uuid::new_v4().to_string()[..8],
+            &anthropic_body,
+            &request_body,
+        );
+    }
+
+    // 计算 prompt cache 模拟（必须在 system/messages 被 move 之前）
+    let session_fp = prompt_cache::compute_session_fingerprint(
+        payload.metadata.as_ref().and_then(|m| m.user_id.as_deref()),
+        payload.system.as_ref(),
+        &payload.messages,
+        &payload.model,
+    );
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -300,6 +321,8 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
+
+    let cache_read_tokens = state.prompt_cache.compute_and_update(session_fp, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -317,9 +340,12 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_read_tokens,
             thinking_enabled,
             tool_name_map,
             state.request_log.clone(),
+            state.prompt_cache.clone(),
+            session_fp,
             start_time,
             caller_name,
         )
@@ -332,9 +358,12 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_read_tokens,
             extract_thinking,
             tool_name_map,
             state.request_log.clone(),
+            state.prompt_cache.clone(),
+            session_fp,
             start_time,
             caller_name,
         ).await
@@ -347,9 +376,12 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_read_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     request_log: RequestLogStore,
+    prompt_cache: Arc<PromptCacheTracker>,
+    session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
 ) -> Response {
@@ -365,6 +397,7 @@ async fn handle_stream_request(
                     model: model_owned,
                     input_tokens,
                     output_tokens: 0,
+                    cache_read_tokens,
                     ttft_ms: None,
                     duration_ms,
                     timestamp: now_ms(),
@@ -380,13 +413,13 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking_and_start(model, input_tokens, thinking_enabled, tool_name_map, start_time);
+    let mut ctx = StreamContext::new_with_thinking_and_start(model, input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, start_time);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流（带请求记录）
-    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, credential_id, start_time, caller_name);
+    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name);
 
     // 返回 SSE 响应
     Response::builder()
@@ -414,7 +447,10 @@ fn create_sse_stream(
     request_log: RequestLogStore,
     model: String,
     input_tokens: i32,
+    cache_read_tokens: i32,
     credential_id: u64,
+    prompt_cache: Arc<PromptCacheTracker>,
+    session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -429,8 +465,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, credential_id, start_time, caller_name),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, credential_id, start_time, caller_name)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)| async move {
             if finished {
                 return None;
             }
@@ -473,7 +509,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, got_first_token, request_log, model, input_tokens, credential_id, start_time, caller_name)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, got_first_token, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -481,6 +517,9 @@ fn create_sse_stream(
                             let ttft_ms = ctx.ttft_ms();
                             let credits = ctx.credits();
                             let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
+                            if ctx.context_input_tokens.is_some() {
+                                prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
+                            }
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -494,6 +533,7 @@ fn create_sse_stream(
                                     model,
                                     input_tokens: final_input_tokens,
                                     output_tokens,
+                                    cache_read_tokens,
                                     ttft_ms,
                                     duration_ms,
                                     timestamp: now_ms(),
@@ -504,7 +544,7 @@ fn create_sse_stream(
                                     caller: caller_name,
                                 });
                             });
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, start_time, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -512,6 +552,9 @@ fn create_sse_stream(
                             let ttft_ms = ctx.ttft_ms();
                             let credits = ctx.credits();
                             let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
+                            if ctx.context_input_tokens.is_some() {
+                                prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -524,6 +567,7 @@ fn create_sse_stream(
                                     model,
                                     input_tokens: final_input_tokens,
                                     output_tokens,
+                                    cache_read_tokens,
                                     ttft_ms,
                                     duration_ms,
                                     timestamp: now_ms(),
@@ -534,7 +578,7 @@ fn create_sse_stream(
                                     caller: caller_name,
                                 });
                             });
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, start_time, None)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_token_received, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)))
                         }
                     }
                 }
@@ -542,7 +586,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, credential_id, start_time, caller_name)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)))
                 }
             }
         },
@@ -560,9 +604,12 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_read_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     request_log: RequestLogStore,
+    prompt_cache: Arc<PromptCacheTracker>,
+    session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
 ) -> Response {
@@ -577,6 +624,7 @@ async fn handle_non_stream_request(
                     model: model_owned,
                     input_tokens,
                     output_tokens: 0,
+                    cache_read_tokens,
                     ttft_ms: None,
                     duration_ms,
                     timestamp: now_ms(),
@@ -747,6 +795,10 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    if context_input_tokens.is_some() {
+        prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
+    }
+
     // 异步记录请求
     {
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -756,6 +808,7 @@ async fn handle_non_stream_request(
                 model: model_owned,
                 input_tokens: final_input_tokens,
                 output_tokens,
+                cache_read_tokens,
                 ttft_ms: None,
                 duration_ms,
                 timestamp: now_ms(),
@@ -779,7 +832,9 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation_input_tokens": 0
         }
     });
 
@@ -946,6 +1001,24 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 调试日志：记录原始请求和转换后的请求
+    if state.debug_logger.is_enabled() {
+        let anthropic_body = serde_json::to_string_pretty(&payload).unwrap_or_default();
+        state.debug_logger.log_request(
+            &Uuid::new_v4().to_string()[..8],
+            &anthropic_body,
+            &request_body,
+        );
+    }
+
+    // 计算 prompt cache 模拟（必须在 system/messages 被 move 之前）
+    let session_fp = prompt_cache::compute_session_fingerprint(
+        payload.metadata.as_ref().and_then(|m| m.user_id.as_deref()),
+        payload.system.as_ref(),
+        &payload.messages,
+        &payload.model,
+    );
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -953,6 +1026,8 @@ pub async fn post_messages_cc(
         payload.messages,
         payload.tools,
     ) as i32;
+
+    let cache_read_tokens = state.prompt_cache.compute_and_update(session_fp, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -970,9 +1045,12 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_read_tokens,
             thinking_enabled,
             tool_name_map,
             state.request_log.clone(),
+            state.prompt_cache.clone(),
+            session_fp,
             start_time,
             caller_name,
         )
@@ -985,9 +1063,12 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_read_tokens,
             extract_thinking,
             tool_name_map,
             state.request_log.clone(),
+            state.prompt_cache.clone(),
+            session_fp,
             start_time,
             caller_name,
         ).await
@@ -1003,9 +1084,12 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
+    cache_read_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     request_log: RequestLogStore,
+    prompt_cache: Arc<PromptCacheTracker>,
+    session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
 ) -> Response {
@@ -1020,6 +1104,7 @@ async fn handle_stream_request_buffered(
                     model: model_owned,
                     input_tokens: estimated_input_tokens,
                     output_tokens: 0,
+                    cache_read_tokens,
                     ttft_ms: None,
                     duration_ms,
                     timestamp: now_ms(),
@@ -1035,10 +1120,10 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new_with_start(model, estimated_input_tokens, thinking_enabled, tool_name_map, start_time);
+    let ctx = BufferedStreamContext::new_with_start(model, estimated_input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, start_time);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, credential_id, start_time, caller_name);
+    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1063,7 +1148,10 @@ fn create_buffered_sse_stream(
     request_log: RequestLogStore,
     model: String,
     input_tokens: i32,
+    cache_read_tokens: i32,
     credential_id: u64,
+    prompt_cache: Arc<PromptCacheTracker>,
+    session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -1079,11 +1167,14 @@ fn create_buffered_sse_stream(
             request_log,
             model,
             input_tokens,
+            cache_read_tokens,
             credential_id,
+            prompt_cache,
+            session_fp,
             start_time,
             caller_name,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, credential_id, start_time, caller_name)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)| async move {
             if finished {
                 return None;
             }
@@ -1097,7 +1188,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, credential_id, start_time, caller_name)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name)));
                     }
 
                     // 然后处理数据流
@@ -1129,6 +1220,9 @@ fn create_buffered_sse_stream(
                                 let ttft_ms = ctx.ttft_ms();
                                 let credits = ctx.credits();
                                 let final_input_tokens = ctx.final_input_tokens();
+                                if ctx.has_context_input_tokens() {
+                                    prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1140,6 +1234,7 @@ fn create_buffered_sse_stream(
                                         model,
                                         input_tokens: final_input_tokens,
                                         output_tokens,
+                                        cache_read_tokens,
                                         ttft_ms,
                                         duration_ms,
                                         timestamp: now_ms(),
@@ -1150,7 +1245,7 @@ fn create_buffered_sse_stream(
                                         caller: caller_name,
                                     });
                                 });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, start_time, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)));
                             }
                             None => {
                                 // 流结束
@@ -1158,6 +1253,9 @@ fn create_buffered_sse_stream(
                                 let ttft_ms = ctx.ttft_ms();
                                 let credits = ctx.credits();
                                 let final_input_tokens = ctx.final_input_tokens();
+                                if ctx.has_context_input_tokens() {
+                                    prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1169,6 +1267,7 @@ fn create_buffered_sse_stream(
                                         model,
                                         input_tokens: final_input_tokens,
                                         output_tokens,
+                                        cache_read_tokens,
                                         ttft_ms,
                                         duration_ms,
                                         timestamp: now_ms(),
@@ -1179,7 +1278,7 @@ fn create_buffered_sse_stream(
                                         caller: caller_name,
                                     });
                                 });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, start_time, None)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None)));
                             }
                         }
                     }

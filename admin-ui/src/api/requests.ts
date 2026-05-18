@@ -22,6 +22,7 @@ export interface RequestRecord {
   model: string
   inputTokens: number
   outputTokens: number
+  cacheReadTokens: number
   ttftMs: number | null
   durationMs: number
   timestamp: number
@@ -44,6 +45,7 @@ export interface RequestStats {
   successCount: number
   totalInputTokens: number
   totalOutputTokens: number
+  totalCacheReadTokens: number
   avgDurationMs: number
   avgTtftMs: number
   totalCredits: number
@@ -53,6 +55,7 @@ export interface ModelUsage {
   requests: number
   input_tokens: number
   output_tokens: number
+  cache_read_tokens: number
   credits: number
 }
 
@@ -62,9 +65,9 @@ export interface MonthlyUsage {
   callers?: Record<string, Record<string, ModelUsage>>
 }
 
-export async function getRequestLogs(page = 1, pageSize = 50): Promise<RequestLogResponse> {
+export async function getRequestLogs(page = 1, pageSize = 50, caller?: string): Promise<RequestLogResponse> {
   const { data } = await api.get<RequestLogResponse>('/requests', {
-    params: { page, pageSize },
+    params: { page, pageSize, ...(caller ? { caller } : {}) },
   })
   return data
 }

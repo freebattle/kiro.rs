@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::debug_log::OptionalDebugLogger;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::ApiKeyEntry;
 use crate::request_log::RequestLogStore;
@@ -26,9 +27,11 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     request_log: RequestLogStore,
+    debug_logger: OptionalDebugLogger,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking, request_log)
-        .with_api_keys(api_keys);
+        .with_api_keys(api_keys)
+        .with_debug_logger(debug_logger);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

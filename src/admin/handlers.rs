@@ -147,6 +147,7 @@ pub struct RequestLogQuery {
     pub page: Option<usize>,
     #[serde(rename = "pageSize")]
     pub page_size: Option<usize>,
+    pub caller: Option<String>,
 }
 
 /// GET /api/admin/requests
@@ -157,7 +158,8 @@ pub async fn get_request_logs(
 ) -> impl IntoResponse {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).min(200);
-    let (records, total) = state.request_log.get_today_paged(page, page_size);
+    let caller = query.caller.as_deref();
+    let (records, total) = state.request_log.get_today_paged(page, page_size, caller);
     Json(serde_json::json!({
         "records": records,
         "total": total,

@@ -110,6 +110,11 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 调试日志目录（设置后开启请求报文记录，不设置则关闭）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_log_dir: Option<String>,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -195,6 +200,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            debug_log_dir: None,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

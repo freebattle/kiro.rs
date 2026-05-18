@@ -198,14 +198,49 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 消息内容
     for msg in &messages {
         if let serde_json::Value::String(s) = &msg.content {
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            total += count_tokens(text);
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(text) = item.get("thinking").and_then(|v| v.as_str()) {
+                            total += count_tokens(text);
+                        }
+                    }
+                    Some("tool_use") => {
+                        if let Some(input) = item.get("input") {
+                            let s = serde_json::to_string(input).unwrap_or_default();
+                            total += count_tokens(&s);
+                        }
+                    }
+                    Some("tool_result") => {
+                        match item.get("content") {
+                            Some(serde_json::Value::String(s)) => {
+                                total += count_tokens(s);
+                            }
+                            Some(serde_json::Value::Array(blocks)) => {
+                                for block in blocks {
+                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                        total += count_tokens(text);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {
+                        // 其他类型按 JSON 序列化长度估算
+                        let s = serde_json::to_string(item).unwrap_or_default();
+                        total += count_tokens(&s);
+                    }
                 }
             }
         }

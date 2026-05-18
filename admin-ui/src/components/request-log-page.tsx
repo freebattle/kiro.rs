@@ -15,13 +15,14 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
+  const [callerFilter, setCallerFilter] = useState<string | null>(null)
   const pageSize = 50
 
   const fetchData = useCallback(async () => {
     setLoading(true)
     try {
       const [logRes, statsRes] = await Promise.all([
-        getRequestLogs(page, pageSize),
+        getRequestLogs(page, pageSize, callerFilter ?? undefined),
         getRequestStats(),
       ])
       setRecords(logRes.records)
@@ -32,7 +33,12 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
     } finally {
       setLoading(false)
     }
-  }, [page])
+  }, [page, callerFilter])
+
+  const handleCallerClick = (caller: string) => {
+    setCallerFilter(prev => prev === caller ? null : caller)
+    setPage(1)
+  }
 
   useEffect(() => {
     fetchData()
@@ -57,6 +63,15 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
             </Button>
             <span className="font-semibold">请求记录</span>
             <Badge variant="secondary">{total} 条</Badge>
+            {callerFilter && (
+              <Badge
+                variant="default"
+                className="cursor-pointer gap-1"
+                onClick={() => { setCallerFilter(null); setPage(1) }}
+              >
+                {callerFilter} ✕
+              </Badge>
+            )}
           </div>
           <Button variant="ghost" size="icon" onClick={fetchData} disabled={loading}>
             <RefreshCw className={`h-5 w-5 ${loading ? 'animate-spin' : ''}`} />
@@ -67,7 +82,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
         {stats && (
-          <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-7 mb-6">
+          <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-8 mb-6">
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm font-medium text-muted-foreground">今日请求</CardTitle>
@@ -99,7 +114,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">输入 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{formatTokens(stats.totalInputTokens)}</div>
+                <div className="text-2xl font-bold">{formatTokens(stats.totalInputTokens - stats.totalCacheReadTokens)}</div>
               </CardContent>
             </Card>
             <Card>
@@ -108,6 +123,14 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
               </CardHeader>
               <CardContent>
                 <div className="text-2xl font-bold">{formatTokens(stats.totalOutputTokens)}</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium text-muted-foreground">模拟缓存 Tokens</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold">{formatTokens(stats.totalCacheReadTokens)}</div>
               </CardContent>
             </Card>
             <Card>
@@ -140,6 +163,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                     <th className="text-left p-3 font-medium">模型</th>
                     <th className="text-right p-3 font-medium">输入</th>
                     <th className="text-right p-3 font-medium">输出</th>
+                    <th className="text-right p-3 font-medium">模拟缓存</th>
                     <th className="text-right p-3 font-medium">Credits</th>
                     <th className="text-right p-3 font-medium">首字</th>
                     <th className="text-right p-3 font-medium">总耗时</th>
@@ -158,8 +182,9 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                       <td className="p-3 whitespace-nowrap font-mono text-xs">
                         {shortenModel(record.model)}
                       </td>
-                      <td className="p-3 text-right tabular-nums">{record.inputTokens.toLocaleString()}</td>
-                      <td className="p-3 text-right tabular-nums">{record.outputTokens.toLocaleString()}</td>
+                      <td className="p-3 text-right tabular-nums">{formatTokenCount(record.inputTokens - record.cacheReadTokens)}</td>
+                      <td className="p-3 text-right tabular-nums">{formatTokenCount(record.outputTokens)}</td>
+                      <td className="p-3 text-right tabular-nums">{record.cacheReadTokens > 0 ? formatTokenCount(record.cacheReadTokens) : '-'}</td>
                       <td className="p-3 text-right tabular-nums text-amber-600">
                         {record.credits > 0 ? formatCredits(record.credits) : '-'}
                       </td>
@@ -174,7 +199,13 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                       </td>
                       <td className="p-3 text-center">
                         {record.caller ? (
-                          <Badge variant="secondary" className="text-xs">{record.caller}</Badge>
+                          <Badge
+                            variant={callerFilter === record.caller ? 'default' : 'secondary'}
+                            className="text-xs cursor-pointer select-none"
+                            onClick={() => handleCallerClick(record.caller!)}
+                          >
+                            {record.caller}
+                          </Badge>
                         ) : (
                           <span className="text-muted-foreground">-</span>
                         )}
@@ -193,7 +224,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                   ))}
                   {records.length === 0 && (
                     <tr>
-                      <td colSpan={11} className="p-8 text-center text-muted-foreground">
+                      <td colSpan={12} className="p-8 text-center text-muted-foreground">
                         暂无请求记录
                       </td>
                     </tr>
@@ -247,6 +278,11 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return String(n)
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 10_000) return `${Math.round(n / 1_000)}k`
+  return n.toLocaleString()
 }
 
 function formatCredits(n: number): string {

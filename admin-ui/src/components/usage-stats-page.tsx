@@ -92,7 +92,7 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
               <CardTitle className="text-sm font-medium text-muted-foreground">总输入 Tokens</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{formatTokens(totals.inputTokens)}</div>
+              <div className="text-2xl font-bold">{formatTokens(totals.inputTokens - totals.cacheReadTokens)}</div>
             </CardContent>
           </Card>
           <Card>
@@ -133,8 +133,8 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
                         <td className="p-3 font-mono text-xs">{shortenModel(row.model)}</td>
                         <td className="p-3 text-right tabular-nums">{row.usage.requests.toLocaleString()}</td>
                         <td className="p-3 text-right tabular-nums text-amber-600">{formatCredits(row.usage.credits)}</td>
-                        <td className="p-3 text-right tabular-nums">{row.usage.input_tokens.toLocaleString()}</td>
-                        <td className="p-3 text-right tabular-nums">{row.usage.output_tokens.toLocaleString()}</td>
+                        <td className="p-3 text-right tabular-nums">{formatTokens(row.usage.input_tokens)}</td>
+                        <td className="p-3 text-right tabular-nums">{formatTokens(row.usage.output_tokens)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -157,6 +157,7 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
                     <th className="text-right p-3 font-medium">Credits</th>
                     <th className="text-right p-3 font-medium">输入 Tokens</th>
                     <th className="text-right p-3 font-medium">输出 Tokens</th>
+                    <th className="text-right p-3 font-medium">模拟缓存</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -168,13 +169,14 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
                       <td className="p-3 font-mono text-xs">{shortenModel(row.model)}</td>
                       <td className="p-3 text-right tabular-nums">{row.usage.requests.toLocaleString()}</td>
                       <td className="p-3 text-right tabular-nums text-amber-600">{formatCredits(row.usage.credits)}</td>
-                      <td className="p-3 text-right tabular-nums">{row.usage.input_tokens.toLocaleString()}</td>
-                      <td className="p-3 text-right tabular-nums">{row.usage.output_tokens.toLocaleString()}</td>
+                      <td className="p-3 text-right tabular-nums">{formatTokens(row.usage.input_tokens)}</td>
+                      <td className="p-3 text-right tabular-nums">{formatTokens(row.usage.output_tokens)}</td>
+                      <td className="p-3 text-right tabular-nums">{row.usage.cache_read_tokens > 0 ? formatTokens(row.usage.cache_read_tokens) : '-'}</td>
                     </tr>
                   ))}
                   {rows.length === 0 && !loading && (
                     <tr>
-                      <td colSpan={6} className="p-8 text-center text-muted-foreground">
+                      <td colSpan={7} className="p-8 text-center text-muted-foreground">
                         本月暂无用量数据
                       </td>
                     </tr>
@@ -231,14 +233,15 @@ function flattenCallerUsage(data: MonthlyUsage | null): CallerRow[] {
 }
 
 function computeTotals(rows: FlatRow[]) {
-  let requests = 0, inputTokens = 0, outputTokens = 0, credits = 0
+  let requests = 0, inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, credits = 0
   for (const r of rows) {
     requests += r.usage.requests
     inputTokens += r.usage.input_tokens
     outputTokens += r.usage.output_tokens
+    cacheReadTokens += r.usage.cache_read_tokens || 0
     credits += r.usage.credits || 0
   }
-  return { requests, inputTokens, outputTokens, credits }
+  return { requests, inputTokens, outputTokens, cacheReadTokens, credits }
 }
 
 function formatTokens(n: number): string {

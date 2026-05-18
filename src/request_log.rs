@@ -19,6 +19,7 @@ pub struct RequestRecord {
     pub model: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub cache_read_tokens: i32,
     /// 首字耗时（毫秒），仅流式请求有值
     pub ttft_ms: Option<u64>,
     /// 请求总耗时（毫秒）
@@ -65,7 +66,7 @@ impl RequestLogStore {
         // 记录用量统计（仅成功请求）
         if record.success {
             if let (Some(stats), Some(cred_id)) = (&inner.usage_stats, record.credential_id) {
-                stats.record(cred_id, &record.model, record.input_tokens, record.output_tokens, record.credits, record.caller.as_deref());
+                stats.record(cred_id, &record.model, record.input_tokens, record.output_tokens, record.cache_read_tokens, record.credits, record.caller.as_deref());
             }
         }
         if inner.records.len() >= MAX_RECORDS {
@@ -85,13 +86,17 @@ impl RequestLogStore {
             .collect()
     }
 
-    /// 获取当天记录，支持分页
-    pub fn get_today_paged(&self, page: usize, page_size: usize) -> (Vec<RequestRecord>, usize) {
+    /// 获取当天记录，支持分页和 caller 过滤
+    pub fn get_today_paged(&self, page: usize, page_size: usize, caller: Option<&str>) -> (Vec<RequestRecord>, usize) {
         let today_start = today_start_ms();
         let inner = self.inner.read();
         let today_records: Vec<&RequestRecord> = inner.records
             .iter()
             .filter(|r| r.timestamp >= today_start)
+            .filter(|r| match caller {
+                Some(c) => r.caller.as_deref() == Some(c),
+                None => true,
+            })
             .collect();
         let total = today_records.len();
         let start = total.saturating_sub(page * page_size);
@@ -130,6 +135,7 @@ impl RequestLogStore {
         let success_count = today.iter().filter(|r| r.success).count() as u64;
         let total_input_tokens: i64 = today.iter().map(|r| r.input_tokens as i64).sum();
         let total_output_tokens: i64 = today.iter().map(|r| r.output_tokens as i64).sum();
+        let total_cache_read_tokens: i64 = today.iter().map(|r| r.cache_read_tokens as i64).sum();
         let total_credits: f64 = today.iter().map(|r| r.credits).sum();
         let avg_duration_ms = if total > 0 {
             today.iter().map(|r| r.duration_ms).sum::<u64>() / total
@@ -150,6 +156,7 @@ impl RequestLogStore {
             success_count,
             total_input_tokens,
             total_output_tokens,
+            total_cache_read_tokens,
             avg_duration_ms,
             avg_ttft_ms,
             total_credits,
@@ -164,6 +171,7 @@ pub struct RequestStats {
     pub success_count: u64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
     pub avg_duration_ms: u64,
     pub avg_ttft_ms: u64,
     pub total_credits: f64,
