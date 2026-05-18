@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::{AppState, CallerIdentity};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::stream::{SseEvent, StreamContext};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
 use super::websearch;
 use crate::prompt_cache;
 use crate::prompt_cache::PromptCacheTracker;
@@ -95,29 +95,11 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1778112000, // May 7, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
             created: 1770163200, // Feb 4, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -131,29 +113,11 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
             id: "claude-opus-4-5-20251101".to_string(),
             object: "model".to_string(),
             created: 1763942400, // Nov 24, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -167,29 +131,11 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
             created: 1760486400, // Oct 15, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -207,7 +153,7 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     caller: Option<axum::Extension<CallerIdentity>>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     let caller_name = caller.map(|c| c.0.name);
     let start_time = Instant::now();
@@ -233,9 +179,6 @@ pub async fn post_messages(
                 .into_response();
         }
     };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -853,46 +796,6 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - sonnet 4.6 / opus 4.6 / opus 4.7：覆写为 adaptive 类型，支持 output_config.effort
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
-        return;
-    }
-
-    // adaptive 模式：sonnet 4.6、opus 4.6、opus 4.7
-    let is_adaptive = (model_lower.contains("sonnet") && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || (model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || (model_lower.contains("opus") && (model_lower.contains("4-7") || model_lower.contains("4.7")));
-
-    let thinking_type = if is_adaptive { "adaptive" } else { "enabled" };
-
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
-
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-    });
-
-    if is_adaptive {
-        // 优先保留客户端传入的 effort，未传时默认 "high"
-        let effort = payload
-            .output_config
-            .as_ref()
-            .map(|c| c.effort.clone())
-            .unwrap_or_else(|| "high".to_string());
-        payload.output_config = Some(OutputConfig { effort });
-    }
-}
 
 /// POST /v1/messages/count_tokens
 ///
@@ -916,400 +819,4 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
-}
-
-/// POST /cc/v1/messages
-///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
-pub async fn post_messages_cc(
-    State(state): State<AppState>,
-    caller: Option<axum::Extension<CallerIdentity>>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    let caller_name = caller.map(|c| c.0.name);
-    let start_time = Instant::now();
-    tracing::info!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /cc/v1/messages request"
-    );
-
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-    }
-
-    // 转换请求
-    let conversion_result = match convert_request(&payload) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 调试日志：记录原始请求和转换后的请求
-    if state.debug_logger.is_enabled() {
-        let anthropic_body = serde_json::to_string_pretty(&payload).unwrap_or_default();
-        state.debug_logger.log_request(
-            &Uuid::new_v4().to_string()[..8],
-            &anthropic_body,
-            &request_body,
-        );
-    }
-
-    // 计算 prompt cache 模拟（必须在 system/messages 被 move 之前）
-    let session_fp = prompt_cache::compute_session_fingerprint(
-        payload.metadata.as_ref().and_then(|m| m.user_id.as_deref()),
-        payload.system.as_ref(),
-        &payload.messages,
-        &payload.model,
-    );
-
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
-
-    let cache_read_tokens = state.prompt_cache.compute_and_update(session_fp, input_tokens);
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let thinking_effort = payload.output_config.as_ref().map(|c| c.effort.clone());
-
-    let tool_name_map = conversion_result.tool_name_map;
-
-    if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            cache_read_tokens,
-            thinking_enabled,
-            tool_name_map,
-            state.request_log.clone(),
-            state.prompt_cache.clone(),
-            session_fp,
-            start_time,
-            caller_name,
-            thinking_effort,
-        )
-        .await
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            cache_read_tokens,
-            extract_thinking,
-            tool_name_map,
-            state.request_log.clone(),
-            state.prompt_cache.clone(),
-            session_fp,
-            start_time,
-            caller_name,
-            thinking_effort,
-        ).await
-    }
-}
-
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    estimated_input_tokens: i32,
-    cache_read_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    request_log: RequestLogStore,
-    prompt_cache: Arc<PromptCacheTracker>,
-    session_fp: u64,
-    start_time: Instant,
-    caller_name: Option<String>,
-    thinking_effort: Option<String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let duration_ms = start_time.elapsed().as_millis() as u64;
-            let model_owned = model.to_string();
-            tokio::spawn(async move {
-                request_log.push(RequestRecord {
-                    model: model_owned,
-                    input_tokens: estimated_input_tokens,
-                    output_tokens: 0,
-                    cache_read_tokens,
-                    ttft_ms: None,
-                    duration_ms,
-                    timestamp: now_ms(),
-                    stream: true,
-                    credential_id: None,
-                    success: false,
-                    credits: 0.0,
-                    caller: caller_name,
-                    thinking_effort,
-                });
-            });
-            return map_provider_error(e);
-        }
-    };
-
-    // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new_with_start(model, estimated_input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, start_time);
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, request_log, model.to_string(), estimated_input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// 创建缓冲 SSE 事件流
-///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-    request_log: RequestLogStore,
-    model: String,
-    input_tokens: i32,
-    cache_read_tokens: i32,
-    credential_id: u64,
-    prompt_cache: Arc<PromptCacheTracker>,
-    session_fp: u64,
-    start_time: Instant,
-    caller_name: Option<String>,
-    thinking_effort: Option<String>,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            request_log,
-            model,
-            input_tokens,
-            cache_read_tokens,
-            credential_id,
-            prompt_cache,
-            session_fp,
-            start_time,
-            caller_name,
-            thinking_effort,
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                let output_tokens = ctx.output_tokens();
-                                let ttft_ms = ctx.ttft_ms();
-                                let credits = ctx.credits();
-                                let final_input_tokens = ctx.final_input_tokens();
-                                if ctx.has_context_input_tokens() {
-                                    prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
-                                }
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                let duration_ms = start_time.elapsed().as_millis() as u64;
-                                tokio::spawn(async move {
-                                    request_log.push(RequestRecord {
-                                        model,
-                                        input_tokens: final_input_tokens,
-                                        output_tokens,
-                                        cache_read_tokens: cache_read_tokens.min(final_input_tokens),
-                                        ttft_ms,
-                                        duration_ms,
-                                        timestamp: now_ms(),
-                                        stream: true,
-                                        credential_id: Some(credential_id),
-                                        success: false,
-                                        credits,
-                                        caller: caller_name,
-                                        thinking_effort: thinking_effort.clone(),
-                                    });
-                                });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)));
-                            }
-                            None => {
-                                // 流结束
-                                let output_tokens = ctx.output_tokens();
-                                let ttft_ms = ctx.ttft_ms();
-                                let credits = ctx.credits();
-                                let final_input_tokens = ctx.final_input_tokens();
-                                if ctx.has_context_input_tokens() {
-                                    prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
-                                }
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                let duration_ms = start_time.elapsed().as_millis() as u64;
-                                tokio::spawn(async move {
-                                    request_log.push(RequestRecord {
-                                        model,
-                                        input_tokens: final_input_tokens,
-                                        output_tokens,
-                                        cache_read_tokens: cache_read_tokens.min(final_input_tokens),
-                                        ttft_ms,
-                                        duration_ms,
-                                        timestamp: now_ms(),
-                                        stream: true,
-                                        credential_id: Some(credential_id),
-                                        success: true,
-                                        credits,
-                                        caller: caller_name,
-                                        thinking_effort,
-                                    });
-                                });
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, RequestLogStore::new(), String::new(), 0, 0, 0, prompt_cache, session_fp, start_time, None, None)));
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .flatten()
 }

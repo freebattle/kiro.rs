@@ -941,45 +941,10 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_thinking_suffix_sonnet() {
-        // thinking 后缀不应影响 sonnet 模型映射
-        let result = map_model("claude-sonnet-4-5-20250929-thinking");
-        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_5() {
-        // thinking 后缀不应影响 opus 4.5 模型映射
-        let result = map_model("claude-opus-4-5-20251101-thinking");
-        assert_eq!(result, Some("claude-opus-4.5".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_6() {
-        // thinking 后缀不应影响 opus 4.6 模型映射
-        let result = map_model("claude-opus-4-6-thinking");
-        assert_eq!(result, Some("claude-opus-4.6".to_string()));
-    }
-
-    #[test]
     fn test_map_model_opus_4_7() {
         // opus 4.7 模型映射
         let result = map_model("claude-opus-4-7");
         assert_eq!(result, Some("claude-opus-4.7".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_7() {
-        // thinking 后缀不应影响 opus 4.7 模型映射
-        let result = map_model("claude-opus-4-7-thinking");
-        assert_eq!(result, Some("claude-opus-4.7".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_thinking_suffix_haiku() {
-        // thinking 后缀不应影响 haiku 模型映射
-        let result = map_model("claude-haiku-4-5-20251001-thinking");
-        assert_eq!(result, Some("claude-haiku-4.5".to_string()));
     }
 
     #[test]

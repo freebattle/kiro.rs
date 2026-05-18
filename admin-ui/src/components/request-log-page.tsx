@@ -114,7 +114,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">输入 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{formatTokens(stats.totalInputTokens - stats.totalCacheReadTokens)}</div>
+                <div className="text-2xl font-bold">{(stats.totalInputTokens - stats.totalCacheReadTokens).toLocaleString()}</div>
               </CardContent>
             </Card>
             <Card>
@@ -122,7 +122,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">输出 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{formatTokens(stats.totalOutputTokens)}</div>
+                <div className="text-2xl font-bold">{stats.totalOutputTokens.toLocaleString()}</div>
               </CardContent>
             </Card>
             <Card>
@@ -130,7 +130,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">模拟缓存 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{formatTokens(stats.totalCacheReadTokens)}</div>
+                <div className="text-2xl font-bold text-green-500">{formatTokens(stats.totalCacheReadTokens)}</div>
               </CardContent>
             </Card>
             <Card>
@@ -187,9 +187,9 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                           </Badge>
                         )}
                       </td>
-                      <td className="p-3 text-right tabular-nums">{formatTokenCount(record.inputTokens - record.cacheReadTokens)}</td>
-                      <td className="p-3 text-right tabular-nums">{formatTokenCount(record.outputTokens)}</td>
-                      <td className="p-3 text-right tabular-nums">{record.cacheReadTokens > 0 ? formatTokenCount(record.cacheReadTokens) : '-'}</td>
+                      <td className="p-3 text-right tabular-nums">{(record.inputTokens - record.cacheReadTokens).toLocaleString()}</td>
+                      <td className="p-3 text-right tabular-nums">{record.outputTokens.toLocaleString()}</td>
+                      <td className="p-3 text-right tabular-nums text-green-500">{record.cacheReadTokens > 0 ? formatTokenCount(record.cacheReadTokens) : '-'}</td>
                       <td className="p-3 text-right tabular-nums text-amber-600">
                         {record.credits > 0 ? formatCredits(record.credits) : '-'}
                       </td>
