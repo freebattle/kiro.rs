@@ -2,12 +2,12 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::request_log::{RequestLogStore, RequestRecord};
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -22,10 +22,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, claude_upstream_to_legacy_id, convert_request};
 use super::middleware::{AppState, CallerIdentity};
 use super::stream::{SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+};
 use super::websearch;
 use crate::prompt_cache;
 use crate::prompt_cache::PromptCacheTracker;
@@ -142,7 +144,7 @@ fn filter_and_convert(
                 .and_then(|t| t.max_output_tokens)
                 .unwrap_or(64000) as i32;
             Model {
-                id: m.model_id.clone(),
+                id: claude_upstream_to_legacy_id(&m.model_id),
                 object: "model".to_string(),
                 created: 0,
                 owned_by: "anthropic".to_string(),
@@ -332,7 +334,9 @@ pub async fn post_messages(
         payload.tools,
     ) as i32;
 
-    let cache_read_tokens = state.prompt_cache.compute_and_update(session_fp, input_tokens);
+    let cache_read_tokens = state
+        .prompt_cache
+        .compute_and_update(session_fp, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -380,7 +384,8 @@ pub async fn post_messages(
             start_time,
             caller_name,
             thinking_effort,
-        ).await
+        )
+        .await
     }
 }
 
@@ -429,13 +434,34 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking_and_start(model, input_tokens, cache_read_tokens, thinking_enabled, tool_name_map, start_time);
+    let mut ctx = StreamContext::new_with_thinking_and_start(
+        model,
+        input_tokens,
+        cache_read_tokens,
+        thinking_enabled,
+        tool_name_map,
+        start_time,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流（带请求记录）
-    let stream = create_sse_stream(response, ctx, initial_events, request_log, model.to_string(), input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        request_log,
+        model.to_string(),
+        input_tokens,
+        cache_read_tokens,
+        credential_id,
+        prompt_cache,
+        session_fp,
+        start_time,
+        caller_name,
+        thinking_effort,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -716,14 +742,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -742,10 +768,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -862,7 +887,6 @@ async fn handle_non_stream_request(
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
-
 
 /// POST /v1/messages/count_tokens
 ///
