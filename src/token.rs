@@ -221,21 +221,19 @@ fn count_all_tokens_local(
                             total += count_tokens(&s);
                         }
                     }
-                    Some("tool_result") => {
-                        match item.get("content") {
-                            Some(serde_json::Value::String(s)) => {
-                                total += count_tokens(s);
-                            }
-                            Some(serde_json::Value::Array(blocks)) => {
-                                for block in blocks {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                        total += count_tokens(text);
-                                    }
+                    Some("tool_result") => match item.get("content") {
+                        Some(serde_json::Value::String(s)) => {
+                            total += count_tokens(s);
+                        }
+                        Some(serde_json::Value::Array(blocks)) => {
+                            for block in blocks {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    total += count_tokens(text);
                                 }
                             }
-                            _ => {}
                         }
-                    }
+                        _ => {}
+                    },
                     _ => {
                         // 其他类型按 JSON 序列化长度估算
                         let s = serde_json::to_string(item).unwrap_or_default();

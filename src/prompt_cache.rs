@@ -26,11 +26,7 @@ impl PromptCacheTracker {
         }
     }
 
-    pub fn compute_and_update(
-        &self,
-        session_fingerprint: u64,
-        input_tokens: i32,
-    ) -> i32 {
+    pub fn compute_and_update(&self, session_fingerprint: u64, input_tokens: i32) -> i32 {
         let now = Instant::now();
         let mut entries = self.entries.lock();
 

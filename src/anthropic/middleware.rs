@@ -97,7 +97,11 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool, request_log: RequestLogStore) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        request_log: RequestLogStore,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             api_keys: Vec::new(),

@@ -69,7 +69,15 @@ impl RequestLogStore {
         // 记录用量统计（仅成功请求）
         if record.success {
             if let (Some(stats), Some(cred_id)) = (&inner.usage_stats, record.credential_id) {
-                stats.record(cred_id, &record.model, record.input_tokens, record.output_tokens, record.cache_read_tokens, record.credits, record.caller.as_deref());
+                stats.record(
+                    cred_id,
+                    &record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_read_tokens,
+                    record.credits,
+                    record.caller.as_deref(),
+                );
             }
         }
         if inner.records.len() >= MAX_RECORDS {
@@ -82,7 +90,9 @@ impl RequestLogStore {
     pub fn get_today(&self) -> Vec<RequestRecord> {
         let today_start = today_start_ms();
         let inner = self.inner.read();
-        inner.records.iter()
+        inner
+            .records
+            .iter()
             .filter(|r| r.timestamp >= today_start)
             .rev()
             .cloned()
@@ -90,10 +100,16 @@ impl RequestLogStore {
     }
 
     /// 获取当天记录，支持分页和 caller 过滤
-    pub fn get_today_paged(&self, page: usize, page_size: usize, caller: Option<&str>) -> (Vec<RequestRecord>, usize) {
+    pub fn get_today_paged(
+        &self,
+        page: usize,
+        page_size: usize,
+        caller: Option<&str>,
+    ) -> (Vec<RequestRecord>, usize) {
         let today_start = today_start_ms();
         let inner = self.inner.read();
-        let today_records: Vec<&RequestRecord> = inner.records
+        let today_records: Vec<&RequestRecord> = inner
+            .records
             .iter()
             .filter(|r| r.timestamp >= today_start)
             .filter(|r| match caller {
@@ -129,7 +145,8 @@ impl RequestLogStore {
     pub fn get_today_stats(&self) -> RequestStats {
         let today_start = today_start_ms();
         let inner = self.inner.read();
-        let today: Vec<&RequestRecord> = inner.records
+        let today: Vec<&RequestRecord> = inner
+            .records
             .iter()
             .filter(|r| r.timestamp >= today_start)
             .collect();

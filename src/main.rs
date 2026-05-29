@@ -118,10 +118,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -221,7 +218,12 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service, request_log.clone(), usage_stats.clone());
+            let admin_state = admin::AdminState::new(
+                admin_key,
+                admin_service,
+                request_log.clone(),
+                usage_stats.clone(),
+            );
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -242,8 +244,16 @@ async fn main() {
     tracing::info!("启动 Anthropic API 端点: {}", addr);
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     if !config.api_keys.is_empty() {
-        tracing::info!("已配置 {} 个调用者 API Key: {}", config.api_keys.len(),
-            config.api_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(", "));
+        tracing::info!(
+            "已配置 {} 个调用者 API Key: {}",
+            config.api_keys.len(),
+            config
+                .api_keys
+                .iter()
+                .map(|k| k.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");

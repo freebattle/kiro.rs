@@ -53,7 +53,16 @@ impl UsageStatsStore {
         }
     }
 
-    pub fn record(&self, credential_id: u64, model: &str, input_tokens: i32, output_tokens: i32, cache_read_tokens: i32, credits: f64, caller: Option<&str>) {
+    pub fn record(
+        &self,
+        credential_id: u64,
+        model: &str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_tokens: i32,
+        credits: f64,
+        caller: Option<&str>,
+    ) {
         let month = current_month();
         let mut data = self.inner.lock();
         if data.month != month {
