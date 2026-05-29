@@ -203,6 +203,7 @@ async fn main() {
         config.extract_thinking,
         request_log.clone(),
         debug_logger,
+        config.include_open_source_models,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

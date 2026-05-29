@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -9,15 +10,60 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use tokio::sync::RwLock;
 
 use crate::common::auth;
 use crate::debug_log::OptionalDebugLogger;
+use crate::kiro::model::available_models::RemoteModelInfo;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::ApiKeyEntry;
 use crate::prompt_cache::PromptCacheTracker;
 use crate::request_log::RequestLogStore;
 
 use super::types::ErrorResponse;
+
+/// 远程模型列表缓存（懒加载 + TTL）
+#[derive(Clone)]
+pub struct ModelsCache {
+    inner: Arc<RwLock<ModelsCacheInner>>,
+}
+
+struct ModelsCacheInner {
+    models: Vec<RemoteModelInfo>,
+    fetched_at: Option<Instant>,
+}
+
+/// 缓存 TTL：30 分钟
+const MODELS_CACHE_TTL_SECS: u64 = 30 * 60;
+
+impl ModelsCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ModelsCacheInner {
+                models: Vec::new(),
+                fetched_at: None,
+            })),
+        }
+    }
+
+    /// 获取缓存的模型列表（如果未过期）
+    pub async fn get(&self) -> Option<Vec<RemoteModelInfo>> {
+        let guard = self.inner.read().await;
+        let fetched_at = guard.fetched_at?;
+        if fetched_at.elapsed().as_secs() < MODELS_CACHE_TTL_SECS {
+            Some(guard.models.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 更新缓存
+    pub async fn set(&self, models: Vec<RemoteModelInfo>) {
+        let mut guard = self.inner.write().await;
+        guard.models = models;
+        guard.fetched_at = Some(Instant::now());
+    }
+}
 
 /// 调用者身份（通过请求扩展传递）
 #[derive(Clone, Debug)]
@@ -43,6 +89,10 @@ pub struct AppState {
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 调试日志记录器
     pub debug_logger: OptionalDebugLogger,
+    /// 远程模型列表缓存
+    pub models_cache: ModelsCache,
+    /// 是否在模型列表中包含开源模型
+    pub include_open_source_models: bool,
 }
 
 impl AppState {
@@ -56,7 +106,15 @@ impl AppState {
             request_log,
             prompt_cache: Arc::new(PromptCacheTracker::new()),
             debug_logger: OptionalDebugLogger::none(),
+            models_cache: ModelsCache::new(),
+            include_open_source_models: false,
         }
+    }
+
+    /// 设置是否包含开源模型
+    pub fn with_include_open_source_models(mut self, include: bool) -> Self {
+        self.include_open_source_models = include;
+        self
     }
 
     /// 设置多 API Key 列表

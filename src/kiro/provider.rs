@@ -518,4 +518,11 @@ impl KiroProvider {
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
     }
+
+    /// 获取远程可用模型列表（委托给 MultiTokenManager）
+    pub async fn fetch_available_models(
+        &self,
+    ) -> anyhow::Result<crate::kiro::model::available_models::AvailableModelsResponse> {
+        self.token_manager.fetch_available_models().await
+    }
 }

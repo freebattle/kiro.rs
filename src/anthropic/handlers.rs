@@ -80,15 +80,96 @@ fn map_provider_error(err: Error) -> Response {
 
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+/// 返回可用的模型列表（懒加载缓存 + TTL + 硬编码兜底）
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
+    // 1. 尝试读缓存
+    if let Some(remote_models) = state.models_cache.get().await {
+        let models = filter_and_convert(&remote_models, state.include_open_source_models);
+        return Json(ModelsResponse {
+            object: "list".to_string(),
+            data: models,
+        });
+    }
+
+    // 2. 缓存未命中/过期，尝试远程拉取
+    if let Some(provider) = &state.kiro_provider {
+        match provider.fetch_available_models().await {
+            Ok(resp) => {
+                tracing::info!(
+                    "ListAvailableModels 成功，获取到 {} 个模型",
+                    resp.models.len()
+                );
+                state.models_cache.set(resp.models.clone()).await;
+                let models = filter_and_convert(&resp.models, state.include_open_source_models);
+                return Json(ModelsResponse {
+                    object: "list".to_string(),
+                    data: models,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("ListAvailableModels 失败，使用兜底列表: {}", e);
+            }
+        }
+    }
+
+    // 3. 兜底：硬编码列表
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: fallback_models(),
+    })
+}
+
+/// 判断模型 ID 是否为 Claude 系列（含 "auto" 通用模型）
+fn is_claude_model(model_id: &str) -> bool {
+    let id_lower = model_id.to_lowercase();
+    id_lower.starts_with("claude") || id_lower == "auto"
+}
+
+/// 过滤并转换远程模型列表
+fn filter_and_convert(
+    remote: &[crate::kiro::model::available_models::RemoteModelInfo],
+    include_open_source: bool,
+) -> Vec<Model> {
+    remote
+        .iter()
+        .filter(|m| include_open_source || is_claude_model(&m.model_id))
+        .map(|m| {
+            let max_tokens = m
+                .token_limits
+                .as_ref()
+                .and_then(|t| t.max_output_tokens)
+                .unwrap_or(64000) as i32;
+            Model {
+                id: m.model_id.clone(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "anthropic".to_string(),
+                display_name: m.model_name.clone().unwrap_or_else(|| m.model_id.clone()),
+                model_type: "chat".to_string(),
+                max_tokens,
+            }
+        })
+        .collect()
+}
+
+/// 硬编码兜底模型列表（远程不可用时返回）
+fn fallback_models() -> Vec<Model> {
+    vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1780012800,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
-            created: 1778112000, // May 7, 2026
+            created: 1778112000,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7".to_string(),
             model_type: "chat".to_string(),
@@ -97,7 +178,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
+            created: 1770163200,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
@@ -106,45 +187,31 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-sonnet-4-6".to_string(),
             object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
+            created: 1771286400,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
         Model {
-            id: "claude-opus-4-5-20251101".to_string(),
+            id: "claude-sonnet-4-5".to_string(),
             object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
+            created: 1759104000,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
         Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
+            id: "claude-haiku-4-5".to_string(),
             object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
+            created: 1760486400,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
-
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    ]
 }
 
 /// POST /v1/messages

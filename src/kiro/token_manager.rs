@@ -22,6 +22,7 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
+use crate::kiro::model::available_models::AvailableModelsResponse;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
@@ -389,6 +390,69 @@ pub(crate) async fn get_usage_limits(
     }
 
     let data: UsageLimitsResponse = response.json().await?;
+    Ok(data)
+}
+
+/// 获取远程可用模型列表
+///
+/// 调用 `https://q.{region}.amazonaws.com/ListAvailableModels` 接口，
+/// 与 `get_usage_limits` 使用相同的 host、鉴权头和代理配置。
+pub(crate) async fn list_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<AvailableModelsResponse> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let mut url = format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR&maxResults=50",
+        host
+    );
+
+    if let Some(profile_arn) = &credentials.profile_arn {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        kiro_version, machine_id
+    );
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let mut request = client
+        .get(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close");
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("ListAvailableModels 失败: {} {}", status, body_text);
+    }
+
+    let data: AvailableModelsResponse = response.json().await?;
     Ok(data)
 }
 
@@ -1636,6 +1700,13 @@ impl MultiTokenManager {
         }
 
         Ok(usage_limits)
+    }
+
+    /// 获取远程可用模型列表（使用第一个可用凭据）
+    pub async fn fetch_available_models(&self) -> anyhow::Result<AvailableModelsResponse> {
+        let ctx = self.acquire_context(None).await?;
+        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+        list_available_models(&ctx.credentials, &self.config, &ctx.token, effective_proxy.as_ref()).await
     }
 
     /// 添加新凭据（Admin API）

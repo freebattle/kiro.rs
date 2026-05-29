@@ -126,6 +126,10 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模型列表是否包含开源模型（默认 false，仅返回 Claude 模型）
+    #[serde(default)]
+    pub include_open_source_models: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -203,6 +207,7 @@ impl Default for Config {
             debug_log_dir: None,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            include_open_source_models: false,
             config_path: None,
         }
     }
