@@ -14,6 +14,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getRequestLogs, type RequestRecord } from '@/api/requests'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -33,7 +34,12 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
-  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
+  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(() => {
+    if (typeof window === 'undefined') {
+      return new Map()
+    }
+    return storage.getBalanceCache()
+  })
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
@@ -56,6 +62,10 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
+  useEffect(() => {
+    storage.setBalanceCache(balanceMap)
+  }, [balanceMap])
+
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
@@ -74,8 +84,11 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
-    if (!data?.credentials) {
-      setBalanceMap(new Map())
+    if (!data) {
+      return
+    }
+
+    if (!data.credentials) {
       setLoadingBalanceIds(new Set())
       return
     }
@@ -106,6 +119,77 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     })
   }, [data?.credentials])
 
+  useEffect(() => {
+    if (!data?.credentials || data.credentials.length === 0) {
+      return
+    }
+
+    let cancelled = false
+
+    const syncUsageFromLogs = async () => {
+      try {
+        const { records } = await getRequestLogs(1, 100)
+        if (cancelled || records.length === 0) {
+          return
+        }
+
+        const previousCursor = storage.getCreditsSyncCursor()
+        const updates = accumulateCreditsUsage(records, previousCursor)
+
+        if (updates.size > 0) {
+          setBalanceMap(prev => {
+            let changed = false
+            const next = new Map(prev)
+
+            updates.forEach((credits, id) => {
+              const current = next.get(id)
+              if (!current || credits <= 0) {
+                return
+              }
+
+              const usageLimit = current.usageLimit > 0 ? current.usageLimit : 0
+              const nextCurrentUsage = Math.min(usageLimit, current.currentUsage + credits)
+              const nextRemaining = Math.max(0, current.remaining - credits)
+              const nextUsagePercentage = usageLimit > 0
+                ? Math.min(100, (nextCurrentUsage / usageLimit) * 100)
+                : current.usagePercentage
+
+              if (
+                nextCurrentUsage !== current.currentUsage ||
+                nextRemaining !== current.remaining ||
+                nextUsagePercentage !== current.usagePercentage
+              ) {
+                next.set(id, {
+                  ...current,
+                  currentUsage: nextCurrentUsage,
+                  remaining: nextRemaining,
+                  usagePercentage: nextUsagePercentage,
+                })
+                changed = true
+              }
+            })
+
+            return changed ? next : prev
+          })
+        }
+
+        const nextCursor = buildCreditsCursor(records)
+        if (nextCursor) {
+          storage.setCreditsSyncCursor(nextCursor)
+        }
+      } catch {
+        // ignore sync errors to keep the dashboard responsive
+      }
+    }
+
+    const timer = window.setTimeout(syncUsageFromLogs, 1200)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [data?.credentials])
+
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
     document.documentElement.classList.toggle('dark')
@@ -123,6 +207,8 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
 
   const handleLogout = () => {
     storage.removeApiKey()
+    storage.removeBalanceCache()
+    storage.removeCreditsSyncCursor()
     queryClient.clear()
     onLogout()
   }
@@ -802,4 +888,61 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
       />
     </div>
   )
+}
+
+function getRecordKey(record: RequestRecord): string {
+  return [
+    record.timestamp,
+    record.credentialId ?? 'none',
+    record.model,
+    record.inputTokens,
+    record.outputTokens,
+    record.credits,
+  ].join(':')
+}
+
+function accumulateCreditsUsage(
+  records: RequestRecord[],
+  cursor: { lastTimestamp: number; processedKeysAtTimestamp: string[] } | null,
+): Map<number, number> {
+  const updates = new Map<number, number>()
+  const processedKeys = new Set(cursor?.processedKeysAtTimestamp ?? [])
+  const threshold = cursor?.lastTimestamp ?? 0
+
+  const chronological = [...records].sort((a, b) => a.timestamp - b.timestamp)
+
+  for (const record of chronological) {
+    if (!record.success || !record.credentialId || record.credits <= 0) {
+      continue
+    }
+
+    if (record.timestamp < threshold) {
+      continue
+    }
+
+    const key = getRecordKey(record)
+    if (record.timestamp === threshold && processedKeys.has(key)) {
+      continue
+    }
+
+    updates.set(record.credentialId, (updates.get(record.credentialId) ?? 0) + record.credits)
+  }
+
+  return updates
+}
+
+function buildCreditsCursor(
+  records: RequestRecord[],
+): { lastTimestamp: number; processedKeysAtTimestamp: string[] } | null {
+  const successful = records.filter(record => record.success && record.credentialId && record.credits > 0)
+  if (successful.length === 0) {
+    return null
+  }
+
+  const lastTimestamp = Math.max(...successful.map(record => record.timestamp))
+  const processedKeysAtTimestamp = successful
+    .filter(record => record.timestamp === lastTimestamp)
+    .map(getRecordKey)
+
+  return { lastTimestamp, processedKeysAtTimestamp }
 }
