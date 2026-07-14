@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github } from 'lucide-react'
 
-const APP_VERSION = '2026.7.15'
+const APP_VERSION = '2026.7.16'
 const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
