@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github } from 'lucide-react'
+
+const APP_VERSION = '2026.7.15'
+const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -665,9 +668,17 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
               <LogOut className="h-5 w-5" />
             </Button>
+            <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
+              <a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+                <Github className="h-5 w-5" />
+              </a>
+            </Button>
+            <span className="text-xs text-muted-foreground tabular-nums" title={`v${APP_VERSION}`}>
+              v{APP_VERSION}
+            </span>
           </div>
         </div>
       </header>

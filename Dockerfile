@@ -1,8 +1,9 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+# 固定 pnpm 9：pnpm 10 默认拦截 @swc/core / esbuild 的 postinstall，会导致构建失败
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 
