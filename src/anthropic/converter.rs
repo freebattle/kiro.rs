@@ -102,19 +102,37 @@ pub fn is_gpt_model_id(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("gpt-")
 }
 
-/// 判断是否为上游 GPT 5.6 模型（含映射后的 `gpt-5.6-luna`）
+/// 判断是否为上游 GPT 5.6 系列（luna / sol / terra 及未来变体）
 pub fn is_gpt_upstream_model(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase().replace('_', "-");
-    let compact = lower.replace('.', "-");
-    compact == "gpt-5-6-luna" || compact == "gpt-5-6" || compact.starts_with("gpt-5-6-")
+    let compact = normalize_gpt_compact_id(model);
+    compact == "gpt-5-6" || compact.starts_with("gpt-5-6-")
+}
+
+/// 规范化 GPT model 为 compact 形式（小写、`_`→`-`、`.`→`-`）
+fn normalize_gpt_compact_id(model: &str) -> String {
+    model
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace('.', "-")
 }
 
 /// 将客户端 GPT 模型别名映射为 Kiro 上游 modelId
+///
+/// - `gpt-5.6` / `gpt-5-6` → 默认 `gpt-5.6-luna`
+/// - `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra` 等变体：原样传递（仅规范化点号）
 fn map_gpt_model(model: &str) -> Option<String> {
-    let lower = model.to_ascii_lowercase().replace('_', "-");
-    let compact = lower.replace('.', "-");
+    let compact = normalize_gpt_compact_id(model);
     match compact.as_str() {
-        "gpt-5-6" | "gpt-5-6-luna" => Some("gpt-5.6-luna".to_string()),
+        "gpt-5-6" => Some("gpt-5.6-luna".to_string()),
+        other if other.starts_with("gpt-5-6-") => {
+            // gpt-5-6-<variant> → gpt-5.6-<variant>
+            let variant = &other["gpt-5-6-".len()..];
+            if variant.is_empty() {
+                None
+            } else {
+                Some(format!("gpt-5.6-{variant}"))
+            }
+        }
         _ => None,
     }
 }
@@ -175,7 +193,7 @@ pub fn claude_legacy_to_upstream_id(model: &str) -> String {
 
 /// 模型映射：
 /// - Claude：仅做新旧版本号格式兼容，不写死具体模型名
-/// - GPT 5.6：映射到 Kiro 上游 `gpt-5.6-luna`
+/// - GPT 5.6：`gpt-5.6` 默认 luna；`gpt-5.6-luna/sol/terra` 等变体原样传递
 pub fn map_model(model: &str) -> Option<String> {
     if is_claude_id(model) {
         return Some(claude_legacy_to_upstream_id(model));
@@ -186,9 +204,12 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6+ 和 Sonnet 4.6 升级至 1M 上下文。
+/// - Claude Opus 4.6+ / Sonnet 4.6+：1M（Kiro 2026-03-24 升级）
+/// - GPT 5.6 系列：272k（ListAvailableModels / 官方 HAR）
+/// - 其余：200k
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
+        Some(mapped) if is_gpt_upstream_model(&mapped) => 272_000,
         Some(mapped) if is_large_context_claude_model(&mapped) => 1_000_000,
         _ => 200_000,
     }
@@ -1222,7 +1243,22 @@ mod tests {
             map_model("GPT-5.6-LUNA"),
             Some("gpt-5.6-luna".to_string())
         );
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(
+            map_model("gpt-5-6-sol"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
+        assert_eq!(
+            map_model("GPT-5.6-TERRA"),
+            Some("gpt-5.6-terra".to_string())
+        );
         assert!(is_gpt_upstream_model("gpt-5.6-luna"));
+        assert!(is_gpt_upstream_model("gpt-5.6-sol"));
+        assert!(is_gpt_upstream_model("gpt-5.6-terra"));
         assert!(is_gpt_model_id("gpt-5.6-luna"));
     }
 

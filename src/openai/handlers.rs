@@ -311,12 +311,12 @@ async fn handle_non_stream(
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let credits = collected.credits;
     let in_tok = collected.input_tokens.unwrap_or(input_tokens);
+    // 固化本轮最终 input 为 prompt cache 基线（此前 OpenAI 路径漏写，导致 GPT 全量 cache）
+    prompt_cache.update_actual_tokens(session_fp, in_tok);
     {
         let model_owned = model.to_string();
         let log = request_log.clone();
-        let pc = prompt_cache.clone();
         tokio::spawn(async move {
-            let _ = pc; let _ = session_fp;
             let safe_cache = clamp_cache_read(cache_read_tokens, in_tok);
             log.push(RequestRecord {
                 model: model_owned,
@@ -1132,15 +1132,16 @@ impl StreamState {
         }
 
         let duration_ms = self.start_time.elapsed().as_millis() as u64;
+        // 固化本轮最终 input 为 prompt cache 基线（此前 OpenAI 路径漏写，导致 GPT 全量 cache）
+        self.prompt_cache
+            .update_actual_tokens(self.session_fp, in_tok);
         {
             let log = self.request_log.clone();
-            let pc = self.prompt_cache.clone();
             let model = self.model.clone();
             let cache_read_tokens = self.cache_read_tokens;
             let credits = self.credits;
             let credential_id = self.credential_id;
             let caller_name = self.caller_name.clone();
-            let session_fp = self.session_fp;
             let ttft_ms = self
                 .first_token_at
                 .map(|t| t.duration_since(self.start_time).as_millis() as u64);
@@ -1148,7 +1149,6 @@ impl StreamState {
             let in_tok_log = in_tok.max(0);
             let out_tok_log = out_tok.max(0);
             tokio::spawn(async move {
-                let _ = pc; let _ = session_fp;
                 log.push(RequestRecord {
                     model,
                     input_tokens: in_tok_log,

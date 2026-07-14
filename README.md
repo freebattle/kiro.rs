@@ -21,7 +21,7 @@
 
 - **Anthropic API 兼容**: 完整支持 `/v1/messages`、流式 SSE、thinking、tool use
 - **OpenAI Responses 兼容**: 支持 `/v1/responses`（Codex / `wire_api=responses`），含 `previous_response_id`、自定义工具、`additional_tools`
-- **GPT-5.6 上游**: 支持 `gpt-5.6-luna` / `gpt-5.6`，自动注入 `reasoning.effort`
+- **GPT-5.6 上游**: 支持 `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra`（`gpt-5.6` 默认 luna），自动注入 `reasoning.effort`
 - **Claude 1.0.138 协议**: IDE Runtime 端点（`x-amz-target` + `application/x-amz-json-1.0`）、`agentMode=vibe`、`output_config.effort`（Sonnet/Opus）
 - **模型能力区分**: Haiku 不发送 `additionalModelRequestFields`（上游不支持思考强度）
 - **流式响应**: SSE 流式输出，含 ping 保活
@@ -565,7 +565,8 @@ Claude 客户端 ID 会做新旧格式兼容（`claude-opus-4-8` ↔ `claude-opu
 |------------|--------------|------|
 | `claude-*-x-y` / `claude-*-x.y` | 对应 `claude-*-x.y` | 版本号格式兼容 |
 | `*haiku*` | `claude-haiku-4.5` | 无 thinking effort |
-| `gpt-5.6` / `gpt-5.6-luna` / `gpt-5-6` | `gpt-5.6-luna` | GPT 上游 |
+| `gpt-5.6` / `gpt-5-6` | `gpt-5.6-luna` | GPT 默认别名 |
+| `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra` | 同名上游 ID | GPT 5.6 变体 |
 | 其他非 Claude/GPT | 不支持 | 返回模型错误 |
 
 上下文窗口：Opus 4.6+ / Sonnet 4.6+ 按 1M 估算，其余约 200K。

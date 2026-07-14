@@ -174,7 +174,25 @@ fn fallback_models() -> Vec<Model> {
             object: "model".to_string(),
             created: 1781280000,
             owned_by: "openai".to_string(),
-            display_name: "GPT 5.6".to_string(),
+            display_name: "GPT 5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "gpt-5.6-sol".to_string(),
+            object: "model".to_string(),
+            created: 1781280000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Sol".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1781280000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Terra".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 128000,
         },
@@ -587,9 +605,8 @@ fn create_sse_stream(
                             let ttft_ms = ctx.ttft_ms();
                             let credits = ctx.credits();
                             let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
-                            if ctx.context_input_tokens.is_some() {
-                                prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
-                            }
+                            // 无论是否拿到 contextUsage，都用本轮最终 input 固化缓存基线
+                            prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -623,9 +640,8 @@ fn create_sse_stream(
                             let ttft_ms = ctx.ttft_ms();
                             let credits = ctx.credits();
                             let final_input_tokens = ctx.context_input_tokens.unwrap_or(input_tokens);
-                            if ctx.context_input_tokens.is_some() {
-                                prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
-                            }
+                            // 无论是否拿到 contextUsage，都用本轮最终 input 固化缓存基线
+                            prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -918,9 +934,8 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
-    if context_input_tokens.is_some() {
-        prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
-    }
+    // 无论是否拿到 contextUsage，都用本轮最终 input 固化缓存基线
+    prompt_cache.update_actual_tokens(session_fp, final_input_tokens);
 
     // 异步记录请求
     {
