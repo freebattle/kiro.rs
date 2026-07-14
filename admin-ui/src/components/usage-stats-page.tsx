@@ -92,7 +92,7 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
               <CardTitle className="text-sm font-medium text-muted-foreground">总输入 Tokens</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{formatTokens(totals.inputTokens - totals.cacheReadTokens)}</div>
+              <div className="text-2xl font-bold">{formatTokens(Math.max(0, totals.inputTokens - totals.cacheReadTokens))}</div>
             </CardContent>
           </Card>
           <Card>

@@ -333,7 +333,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.api_content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 

@@ -1,13 +1,24 @@
 services:
   kiro-rs:
-    # 使用国内镜像
+    # 使用国内镜像时可改成：
     # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
     image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    # 本地源码构建：
+    # build: .
     container_name: kiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
     volumes:
+      # 配置：放 config.json / credentials.json
       - ./config/:/app/config/
+      # 运行数据：用量统计、Responses 历史、调试日志
+      - ./data/:/app/data/
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      # 可选：注入 Kiro API Key 凭据（不是客户端 apiKey）
+      # - KIRO_API_KEY=ksk_xxx
     restart: unless-stopped
+    # 建议：容器内监听 0.0.0.0（在 config/config.json 里设置 host）
+    # "host": "0.0.0.0", "port": 8990

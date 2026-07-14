@@ -1,0 +1,26 @@
+[Unit]
+Description=kiro-rs Anthropic/OpenAI compatible proxy for Kiro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kiro
+Group=kiro
+WorkingDirectory=/opt/kiro-rs
+ExecStart=/opt/kiro-rs/kiro-rs -c /opt/kiro-rs/config.json --credentials /opt/kiro-rs/credentials.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+# 日志
+Environment=RUST_LOG=info
+# 可选：注入 Kiro API Key 凭据
+# Environment=KIRO_API_KEY=ksk_xxx
+
+# 安全加固（按需调整）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

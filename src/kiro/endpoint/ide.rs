@@ -1,13 +1,16 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 Kiro IDE 1.0.138+ 客户端当前使用的 Kiro Runtime 端点：
+//! - API: `https://runtime.{api_region}.kiro.dev` + `x-amz-target: KiroRuntimeService.GenerateAssistantResponse`
+//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! 请求头使用 aws-sdk-js User-Agent 标识（api/kiroruntime#1.0.0）。
+//! 请求体会在根对象上注入 `profileArn`。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
+
+use crate::kiro::user_agent;
 
 use super::{KiroEndpoint, RequestContext};
 
@@ -27,24 +30,26 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
-        )
+        user_agent::runtime_streaming_x_amz_user_agent(ctx.config, ctx.machine_id)
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            ctx.config.system_version,
-            ctx.config.node_version,
-            ctx.config.kiro_version,
-            ctx.machine_id
-        )
+        user_agent::runtime_streaming_user_agent(ctx.config, ctx.machine_id)
+    }
+
+    /// 官方 Kiro 1.0.138 使用 `TokenType` 头：
+    /// - SSO 登录: SSO_OIDC
+    /// - API Key: API_KEY
+    fn token_type(&self, ctx: &RequestContext<'_>) -> &'static str {
+        if ctx.credentials.is_api_key_credential() {
+            "API_KEY"
+        } else {
+            "SSO_OIDC"
+        }
     }
 }
 
@@ -60,31 +65,31 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        // 1.0.138+：根路径 + x-amz-target，不再走 /generateAssistantResponse
+        format!("https://runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+    }
+
+    fn api_content_type(&self) -> &'static str {
+        "application/x-amz-json-1.0"
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
-            .header("Authorization", format!("Bearer {}", ctx.token));
-
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        req
+        // agentMode 已在请求体根字段发送，官方 1.0.138 不再带 x-amzn-kiro-agent-mode 头
+        req.header(
+            "x-amz-target",
+            "KiroRuntimeService.GenerateAssistantResponse",
+        )
+        .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+        .header("user-agent", self.user_agent(ctx))
+        .header("host", self.host(ctx))
+        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("TokenType", self.token_type(ctx))
+        .header("Authorization", format!("Bearer {}", ctx.token))
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -94,13 +99,11 @@ impl KiroEndpoint for IdeEndpoint {
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
+            .header("TokenType", self.token_type(ctx))
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if let Some(ref arn) = ctx.credentials.profile_arn {
             req = req.header("x-amzn-kiro-profile-arn", arn);
-        }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
         }
         req
     }

@@ -16,6 +16,7 @@ use super::{
     handlers::{count_tokens, get_models, post_messages},
     middleware::{AppState, auth_middleware, cors_layer},
 };
+use crate::openai::post_responses;
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -43,6 +44,7 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/responses", post(post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

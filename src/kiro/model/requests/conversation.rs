@@ -6,6 +6,38 @@ use serde::{Deserialize, Serialize};
 
 use super::tool::{Tool, ToolResult, ToolUseEntry};
 
+/// 历史助手消息中的推理内容
+///
+/// GPT 5.6 上游要求在后续请求 history 中回灌 reasoningContent。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningContent {
+    /// 推理文本包装
+    pub reasoning_text: ReasoningText,
+}
+
+/// 推理文本与签名
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningText {
+    /// 推理文本（GPT 常为 `"..."` 占位）
+    pub text: String,
+    /// 推理签名，需原样回传
+    pub signature: String,
+}
+
+impl ReasoningContent {
+    /// 从文本和签名创建推理内容
+    pub fn new(text: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self {
+            reasoning_text: ReasoningText {
+                text: text.into(),
+                signature: signature.into(),
+            },
+        }
+    }
+}
+
 /// 对话状态
 ///
 /// Kiro API 请求中的核心结构，包含当前消息和历史记录
@@ -303,6 +335,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 推理内容（GPT 5.6 后续请求需回灌）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -311,12 +346,19 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    /// 设置推理内容
+    pub fn with_reasoning_content(mut self, reasoning: ReasoningContent) -> Self {
+        self.reasoning_content = Some(reasoning);
         self
     }
 }
@@ -370,5 +412,37 @@ mod tests {
         assert!(json.contains("\"conversationId\":\"conv-123\""));
         assert!(json.contains("\"agentTaskType\":\"vibe\""));
         assert!(json.contains("\"content\":\"Hello\""));
+    }
+
+    #[test]
+    fn test_assistant_message_with_reasoning_content_serialize() {
+        let msg = AssistantMessage::new("ok")
+            .with_tool_uses(vec![ToolUseEntry::new("call_2", "read_file")])
+            .with_reasoning_content(ReasoningContent::new("...", ".KTR~~sig"));
+
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["content"], "ok");
+        assert_eq!(json["toolUses"][0]["toolUseId"], "call_2");
+        assert_eq!(json["reasoningContent"]["reasoningText"]["text"], "...");
+        assert_eq!(
+            json["reasoningContent"]["reasoningText"]["signature"],
+            ".KTR~~sig"
+        );
+    }
+
+    #[test]
+    fn test_assistant_message_reasoning_content_roundtrip() {
+        let raw = r#"{
+            "content": "ok",
+            "toolUses": [{"toolUseId":"call_2","name":"read_file","input":{}}],
+            "reasoningContent": {
+                "reasoningText": {"text":"...","signature":".KTR~~abc"}
+            }
+        }"#;
+        let msg: AssistantMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.content, "ok");
+        let rc = msg.reasoning_content.unwrap();
+        assert_eq!(rc.reasoning_text.text, "...");
+        assert_eq!(rc.reasoning_text.signature, ".KTR~~abc");
     }
 }

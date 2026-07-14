@@ -7,14 +7,23 @@ use serde::Deserialize;
 /// 使用额度查询响应
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct UsageLimitsResponse {
     /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
     pub next_date_reset: Option<f64>,
 
+    /// 超额配置
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
     /// 订阅信息
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
+
+    /// 用户信息
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
 
     /// 使用量明细列表
     #[serde(default)]
@@ -28,6 +37,26 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+}
+
+/// 超额配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct OverageConfiguration {
+    #[serde(default)]
+    pub overage_status: Option<String>,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct UserInfo {
+    #[serde(default)]
+    pub identity_provider: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// 使用量明细

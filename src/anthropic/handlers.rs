@@ -129,6 +129,11 @@ fn is_claude_model(model_id: &str) -> bool {
     id_lower.starts_with("claude") || id_lower == "auto"
 }
 
+/// 判断是否应在默认模型列表中展示（Claude + GPT 5.6）
+fn is_default_exposed_model(model_id: &str) -> bool {
+    is_claude_model(model_id) || super::converter::is_gpt_upstream_model(model_id)
+}
+
 /// 过滤并转换远程模型列表
 fn filter_and_convert(
     remote: &[crate::kiro::model::available_models::RemoteModelInfo],
@@ -136,18 +141,23 @@ fn filter_and_convert(
 ) -> Vec<Model> {
     remote
         .iter()
-        .filter(|m| include_open_source || is_claude_model(&m.model_id))
+        .filter(|m| include_open_source || is_default_exposed_model(&m.model_id))
         .map(|m| {
             let max_tokens = m
                 .token_limits
                 .as_ref()
                 .and_then(|t| t.max_output_tokens)
                 .unwrap_or(64000) as i32;
+            let owned_by = if super::converter::is_gpt_model_id(&m.model_id) {
+                "openai"
+            } else {
+                "anthropic"
+            };
             Model {
                 id: claude_upstream_to_legacy_id(&m.model_id),
                 object: "model".to_string(),
                 created: 0,
-                owned_by: "anthropic".to_string(),
+                owned_by: owned_by.to_string(),
                 display_name: m.model_name.clone().unwrap_or_else(|| m.model_id.clone()),
                 model_type: "chat".to_string(),
                 max_tokens,
@@ -159,6 +169,15 @@ fn filter_and_convert(
 /// 硬编码兜底模型列表（远程不可用时返回）
 fn fallback_models() -> Vec<Model> {
     vec![
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1781280000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -286,9 +305,12 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // agentMode / additionalModelRequestFields 对齐官方 Kiro 1.0.138+ GPT 抓包
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        agent_mode: conversion_result.agent_mode,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -532,7 +554,12 @@ fn create_sse_stream(
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
                                             if !got_first_token {
-                                                if matches!(&event, Event::AssistantResponse(_)) {
+                                                if matches!(
+                                                    &event,
+                                                    Event::AssistantResponse(_)
+                                                        | Event::ToolUse(_)
+                                                        | Event::ReasoningContent(_)
+                                                ) {
                                                     got_first_token = true;
                                                 }
                                             }
@@ -715,6 +742,9 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut credits: f64 = 0.0;
+    // 来自 reasoningContentEvent（GPT 5.6）
+    let mut reasoning_text: Option<String> = None;
+    let mut reasoning_signature: Option<String> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -765,6 +795,18 @@ async fn handle_non_stream_request(
                                 }));
                             }
                         }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = reasoning.text {
+                                if !text.is_empty() {
+                                    reasoning_text = Some(text);
+                                }
+                            }
+                            if let Some(sig) = reasoning.signature {
+                                if !sig.trim().is_empty() {
+                                    reasoning_signature = Some(sig);
+                                }
+                            }
+                        }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
@@ -808,7 +850,34 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if thinking_enabled {
+    // GPT：必须外露 thinking+signature 供下一轮 history 回灌；可见文案把 `...`
+    // 改写成 Completed.，避免 Claude Code adaptive 续写。
+    // Claude：优先 event reasoning（若启用 thinking），否则回退 <thinking> 标签提取。
+    let is_gpt = super::converter::is_gpt_upstream_model(model);
+    let mut emitted_event_reasoning = false;
+    if reasoning_signature.is_some() || reasoning_text.is_some() {
+        if is_gpt || thinking_enabled {
+            let display_thinking = if is_gpt {
+                match reasoning_text.as_deref().map(str::trim) {
+                    None | Some("") | Some("...") => "Completed.".to_string(),
+                    Some(text) => text.to_string(),
+                }
+            } else {
+                reasoning_text.clone().unwrap_or_else(|| "...".to_string())
+            };
+            let mut thinking_block = json!({
+                "type": "thinking",
+                "thinking": display_thinking
+            });
+            if let Some(sig) = reasoning_signature.clone() {
+                thinking_block["signature"] = json!(sig);
+            }
+            content.push(thinking_block);
+            emitted_event_reasoning = true;
+        }
+    }
+
+    if thinking_enabled && !emitted_event_reasoning && !is_gpt {
         // 从完整文本中提取 thinking 块
         let (thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
@@ -834,6 +903,14 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
+
+    // GPT 无 text/tool：补非空白 text，避免 Claude Code 发 (no content) 续写
+    if is_gpt && text_content.is_empty() && !has_tool_use {
+        content.push(json!({
+            "type": "text",
+            "text": "Done."
+        }));
+    }
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);

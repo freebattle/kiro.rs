@@ -187,7 +187,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                           </Badge>
                         )}
                       </td>
-                      <td className="p-3 text-right tabular-nums">{(record.inputTokens - record.cacheReadTokens).toLocaleString()}</td>
+                      <td className="p-3 text-right tabular-nums">{Math.max(0, record.inputTokens - record.cacheReadTokens).toLocaleString()}</td>
                       <td className="p-3 text-right tabular-nums">{record.outputTokens.toLocaleString()}</td>
                       <td className="p-3 text-right tabular-nums text-green-500">{record.cacheReadTokens > 0 ? formatTokenCount(record.cacheReadTokens) : '-'}</td>
                       <td className="p-3 text-right tabular-nums text-amber-600">

@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroImage, Message, ReasoningContent, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -96,6 +97,28 @@ fn is_claude_id(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("claude-")
 }
 
+/// 判断是否为 GPT 系列模型 ID（含别名）
+pub fn is_gpt_model_id(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("gpt-")
+}
+
+/// 判断是否为上游 GPT 5.6 模型（含映射后的 `gpt-5.6-luna`）
+pub fn is_gpt_upstream_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase().replace('_', "-");
+    let compact = lower.replace('.', "-");
+    compact == "gpt-5-6-luna" || compact == "gpt-5-6" || compact.starts_with("gpt-5-6-")
+}
+
+/// 将客户端 GPT 模型别名映射为 Kiro 上游 modelId
+fn map_gpt_model(model: &str) -> Option<String> {
+    let lower = model.to_ascii_lowercase().replace('_', "-");
+    let compact = lower.replace('.', "-");
+    match compact.as_str() {
+        "gpt-5-6" | "gpt-5-6-luna" => Some("gpt-5.6-luna".to_string()),
+        _ => None,
+    }
+}
+
 fn is_short_numeric_version_part(part: &str) -> bool {
     !part.is_empty() && part.len() <= 2 && part.chars().all(|c| c.is_ascii_digit())
 }
@@ -150,9 +173,14 @@ pub fn claude_legacy_to_upstream_id(model: &str) -> String {
     format!("{}-{}.{}", prefix, major, minor)
 }
 
-/// 模型映射：Claude 模型仅做新旧版本号格式兼容，不写死具体模型名。
+/// 模型映射：
+/// - Claude：仅做新旧版本号格式兼容，不写死具体模型名
+/// - GPT 5.6：映射到 Kiro 上游 `gpt-5.6-luna`
 pub fn map_model(model: &str) -> Option<String> {
-    is_claude_id(model).then(|| claude_legacy_to_upstream_id(model))
+    if is_claude_id(model) {
+        return Some(claude_legacy_to_upstream_id(model));
+    }
+    map_gpt_model(model)
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -193,6 +221,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 根级 agentMode（Kiro 1.0.138+）
+    pub agent_mode: Option<String>,
+    /// 根级 additionalModelRequestFields（GPT reasoning.effort 等）
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -389,6 +421,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
+    // 14. 根级字段：与官方 Kiro 1.0.138+ GPT 抓包对齐
+    // - agentMode: vibe
+    // - additionalModelRequestFields.reasoning.effort: GPT 必需
+    let agent_mode = Some("vibe".to_string());
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+
     if !tool_name_map.is_empty() {
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
@@ -396,13 +434,93 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        agent_mode,
+        additional_model_request_fields,
     })
+}
+
+/// 构建官方 Kiro 根级 additionalModelRequestFields
+///
+/// 新版 Kiro（1.0.138+）抓包差异：
+/// - GPT-5.6-luna: `{"reasoning":{"effort":"high"}}`
+/// - Claude Opus 4.8: `{"output_config":{"effort":"medium"}}`
+/// Claude Code adaptive 的 output_config.effort 会映射到对应字段。
+fn supports_additional_model_request_fields(model_id: &str) -> bool {
+    if is_gpt_upstream_model(model_id) {
+        return true;
+    }
+    let lower = model_id.to_ascii_lowercase();
+    // 官方/实测：Haiku 返回 "additionalModelRequestFields is not supported for this model"
+    // 仅 Sonnet / Opus 走 output_config.effort；GPT 走 reasoning.effort。
+    lower.starts_with("claude-sonnet-") || lower.starts_with("claude-opus-")
+}
+
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<serde_json::Value> {
+    if !supports_additional_model_request_fields(model_id) {
+        return None;
+    }
+
+    let effort = resolve_effort(req, if is_gpt_upstream_model(model_id) {
+        "high"
+    } else {
+        "medium"
+    });
+
+    if is_gpt_upstream_model(model_id) {
+        return Some(serde_json::json!({
+            "reasoning": {
+                "effort": effort
+            }
+        }));
+    }
+
+    // Claude Sonnet / Opus（含 4.8）：官方 1.0.138 固定带 output_config.effort。
+    Some(serde_json::json!({
+        "output_config": {
+            "effort": effort
+        }
+    }))
+}
+
+fn resolve_effort(req: &MessagesRequest, default: &str) -> String {
+    req.output_config
+        .as_ref()
+        .map(|c| c.effort.as_str())
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_string())
+        .or_else(|| {
+            req.thinking.as_ref().and_then(|t| {
+                if t.thinking_type == "adaptive" {
+                    Some(
+                        req.output_config
+                            .as_ref()
+                            .map(|c| c.effort.clone())
+                            .filter(|e| !e.is_empty())
+                            .unwrap_or_else(|| default.to_string()),
+                    )
+                } else if t.is_enabled() {
+                    Some(default.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// 确定聊天触发类型
 /// "AUTO" 模式可能会导致 400 Bad Request 错误
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
+}
+
+/// Claude Code 在 assistant 空响应/thinking 异常时注入的续写占位。
+/// 对 GPT 上游毫无意义，还会污染 history 并放大死循环。
+fn is_no_content_placeholder(text: &str) -> bool {
+    text.trim() == "(no content)"
 }
 
 /// 处理消息内容，提取文本、图片和工具结果
@@ -415,7 +533,9 @@ fn process_message_content(
 
     match content {
         serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
+            if !is_no_content_placeholder(s) {
+                text_parts.push(s.clone());
+            }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
@@ -423,7 +543,9 @@ fn process_message_content(
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(text) = block.text {
-                                text_parts.push(text);
+                                if !is_no_content_placeholder(&text) {
+                                    text_parts.push(text);
+                                }
                             }
                         }
                         "image" => {
@@ -492,113 +614,139 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
     }
 }
 
-/// 验证并过滤 tool_use/tool_result 配对
+/// 验证并过滤 tool_use/tool_result 配对（按实例计数，允许 ID 复用）
 ///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
+/// GPT 上游会复用短 toolUseId（如 `call_2`），同一 ID 可在多轮中出现多次。
+/// 因此不能用全局 HashSet 判重，必须按“未配对实例计数”匹配。
 ///
-/// # Arguments
-/// * `history` - 历史消息引用
-/// * `tool_results` - 当前消息中的 tool_result 列表
+/// 规则：
+/// - 历史中出现一次 tool_use 增加一个未配对计数
+/// - 历史中出现一次 tool_result 消耗一个未配对计数
+/// - 当前 tool_result 仅当仍有未配对实例时保留
+/// - 返回剩余未配对计数，供 `remove_orphaned_tool_uses` 按实例移除
 ///
 /// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
+/// 元组：(过滤后的 tool_result 列表, 仍未配对的 tool_use_id 计数)
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
-) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
-    use std::collections::HashSet;
+) -> (Vec<ToolResult>, std::collections::HashMap<String, usize>) {
+    use std::collections::HashMap;
 
-    // 1. 收集所有历史中的 tool_use_id
-    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
+    // id -> 当前尚未被 result 配对的 tool_use 实例数
+    let mut unpaired_counts: HashMap<String, usize> = HashMap::new();
 
     for msg in history {
         match msg {
             Message::Assistant(assistant_msg) => {
                 if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                     for tool_use in tool_uses {
-                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                        *unpaired_counts
+                            .entry(tool_use.tool_use_id.clone())
+                            .or_insert(0) += 1;
                     }
                 }
             }
             Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
                 for result in &user_msg
                     .user_input_message
                     .user_input_message_context
                     .tool_results
                 {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
+                    match unpaired_counts.get_mut(&result.tool_use_id) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1;
+                            if *count == 0 {
+                                // 清理零计数，便于后续 is_empty 判断
+                                // 但同一 id 后面还可能再次出现 tool_use，保留 entry 更简单：
+                                // 这里仅减到 0，不 remove 也没问题。
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "历史中存在无法匹配 tool_use 的 tool_result，tool_use_id={}",
+                                result.tool_use_id
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
-    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
-        .cloned()
-        .collect();
+    // 清理计数为 0 的 key，避免误报
+    unpaired_counts.retain(|_, count| *count > 0);
 
-    // 4. 过滤并验证当前消息的 tool_results
     let mut filtered_results = Vec::new();
 
     for result in tool_results {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
-            filtered_results.push(result.clone());
-            unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
-            tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
-                result.tool_use_id
-            );
-        } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
-            tracing::warn!(
-                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
-                result.tool_use_id
-            );
+        match unpaired_counts.get_mut(&result.tool_use_id) {
+            Some(count) if *count > 0 => {
+                filtered_results.push(result.clone());
+                *count -= 1;
+            }
+            Some(_) | None => {
+                // 没有剩余未配对实例：要么从未出现，要么该实例已在历史/当前中被配对过
+                tracing::warn!(
+                    "跳过无法匹配的 tool_result：无未配对 tool_use 实例，tool_use_id={}",
+                    result.tool_use_id
+                );
+            }
         }
     }
 
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
-    for orphaned_id in &unpaired_tool_use_ids {
+    unpaired_counts.retain(|_, count| *count > 0);
+
+    for (orphaned_id, count) in &unpaired_counts {
         tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
-            orphaned_id
+            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={} count={}",
+            orphaned_id,
+            count
         );
     }
 
-    (filtered_results, unpaired_tool_use_ids)
+    (filtered_results, unpaired_counts)
 }
 
-/// 从历史消息中移除孤立的 tool_use
+/// 从历史消息中按实例计数移除孤立的 tool_use
 ///
 /// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
-/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
+/// 对同一 tool_use_id 可出现多次的场景（GPT `call_N` 复用），只移除仍未配对的实例，
+/// 并优先移除历史末尾的实例（最新一轮未配对调用）。
 ///
 /// # Arguments
 /// * `history` - 可变的历史消息列表
-/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
+/// * `orphaned_counts` - 仍未配对的 tool_use_id 计数
 fn remove_orphaned_tool_uses(
     history: &mut [Message],
-    orphaned_ids: &std::collections::HashSet<String>,
+    orphaned_counts: &std::collections::HashMap<String, usize>,
 ) {
-    if orphaned_ids.is_empty() {
+    if orphaned_counts.is_empty() {
         return;
     }
 
-    for msg in history.iter_mut() {
+    let mut remaining = orphaned_counts.clone();
+
+    // 从后往前移除，优先清理最新一轮的未配对 tool_use
+    for msg in history.iter_mut().rev() {
         if let Message::Assistant(assistant_msg) = msg {
             if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+                let mut kept = Vec::with_capacity(tool_uses.len());
 
-                // 如果移除后为空，设置为 None
+                // 同一消息内部也从后往前决定是否移除
+                for tool_use in tool_uses.drain(..).rev() {
+                    match remaining.get_mut(&tool_use.tool_use_id) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1;
+                            // drop this orphaned instance
+                        }
+                        _ => kept.push(tool_use),
+                    }
+                }
+                kept.reverse();
+                *tool_uses = kept;
+
                 if tool_uses.is_empty() {
                     assistant_msg.assistant_response_message.tool_uses = None;
                 } else if tool_uses.len() != original_len {
@@ -608,6 +756,10 @@ fn remove_orphaned_tool_uses(
                     );
                 }
             }
+        }
+
+        if remaining.values().all(|c| *c == 0) {
+            break;
         }
     }
 }
@@ -785,7 +937,7 @@ fn build_history(
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged = merge_assistant_messages(&assistant_buffer, model_id, tool_name_map)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -804,7 +956,7 @@ fn build_history(
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages(&assistant_buffer, model_id, tool_name_map)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -861,11 +1013,13 @@ fn merge_user_messages(
 /// 转换 assistant 消息
 fn convert_assistant_message(
     msg: &super::types::Message,
+    model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
+    let mut reasoning_signature: Option<String> = None;
 
     match &msg.content {
         serde_json::Value::String(s) => {
@@ -878,6 +1032,12 @@ fn convert_assistant_message(
                         "thinking" => {
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                            }
+                            // 保留 thinking signature，用于 GPT 上游 reasoning 回灌
+                            if let Some(sig) = block.signature {
+                                if !sig.trim().is_empty() {
+                                    reasoning_signature = Some(sig);
+                                }
                             }
                         }
                         "text" => {
@@ -901,10 +1061,26 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
+    // GPT / Claude 1.0.138+：有 signature 时 thinking 走 reasoningContent，content 仅保留可见文本。
+    // 旧 Claude 路径（无 signature）仍把 thinking 嵌进 content 的 <thinking> 标签。
+    //
+    // - GPT：无 signature 时若客户端带了 thinking 文案，仍尽量附上。
+    // - Claude：官方 1.0.138 Opus 4.8 多轮 history 必须带 reasoningContent.signature，
+    //   不能再塞 <thinking> 进 content（否则延迟抖动/不稳定）。
+    let is_gpt = is_gpt_upstream_model(model_id);
+    let use_reasoning_field = if is_gpt {
+        reasoning_signature.is_some() || !thinking_content.trim().is_empty()
+    } else {
+        reasoning_signature.is_some()
+    };
+
+    let final_content = if use_reasoning_field {
+        // 官方 history：tool-only 轮 content 就是 ""（不是空格）。
+        // 见 data/runtime...16_04_49.har（opus-4.8）与 gpt56_v138 抓包。
+        text_content
+    } else if !thinking_content.is_empty() {
+        // 组合 thinking 和 text 内容
+        // 格式: <thinking>思考内容</thinking>\n\ntext内容
         if !text_content.is_empty() {
             format!(
                 "<thinking>{}</thinking>\n\n{}",
@@ -914,7 +1090,8 @@ fn convert_assistant_message(
             format!("<thinking>{}</thinking>", thinking_content)
         }
     } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
+        // 官方 Claude/GPT tool-only 轮均为空字符串
+        String::new()
     } else {
         text_content
     };
@@ -922,6 +1099,21 @@ fn convert_assistant_message(
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
+    }
+    if use_reasoning_field {
+        // GPT 回灌时常见 `...` 占位；Claude 官方回灌真实 reasoning 文本 + signature。
+        let reasoning_text = if is_gpt {
+            match thinking_content.trim() {
+                "" | "Completed." | "Done." => "...".to_string(),
+                other => other.to_string(),
+            }
+        } else {
+            thinking_content
+        };
+        let sig = reasoning_signature.unwrap_or_default();
+        if !sig.is_empty() {
+            assistant = assistant.with_reasoning_content(ReasoningContent::new(reasoning_text, sig));
+        }
     }
 
     Ok(HistoryAssistantMessage {
@@ -933,18 +1125,21 @@ fn convert_assistant_message(
 /// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
+    model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        return convert_assistant_message(messages[0], model_id, tool_name_map);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // 合并时保留最后一条非空 reasoning（GPT 上游要求）
+    let mut reasoning_content: Option<ReasoningContent> = None;
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+        let converted = convert_assistant_message(msg, model_id, tool_name_map)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -952,17 +1147,20 @@ fn merge_assistant_messages(
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
         }
+        if am.reasoning_content.is_some() {
+            reasoning_content = am.reasoning_content;
+        }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
+    // 官方 1.0.138 history：tool-only 轮 content 为空串，不再用空格占位。
+    let content = content_parts.join("\n\n");
 
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
+    }
+    if let Some(rc) = reasoning_content {
+        assistant = assistant.with_reasoning_content(rc);
     }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
@@ -1004,6 +1202,28 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+        assert!(map_model("gpt-4o").is_none());
+        assert!(map_model("o1-preview").is_none());
+    }
+
+    #[test]
+    fn test_map_model_gpt_5_6() {
+        assert_eq!(
+            map_model("gpt-5.6-luna"),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert_eq!(map_model("gpt-5.6"), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(
+            map_model("gpt-5-6-luna"),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert_eq!(map_model("gpt-5-6"), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(
+            map_model("GPT-5.6-LUNA"),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert!(is_gpt_upstream_model("gpt-5.6-luna"));
+        assert!(is_gpt_model_id("gpt-5.6-luna"));
     }
 
     #[test]
@@ -1484,9 +1704,9 @@ mod tests {
         let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
         // 结果应该为空（因为没有 tool_result）
-        // 同时应该返回孤立的 tool_use_id
+        // 同时应该返回孤立的 tool_use_id 计数
         assert!(filtered.is_empty());
-        assert!(orphaned.contains("tool-orphan"));
+        assert_eq!(orphaned.get("tool-orphan"), Some(&1));
     }
 
     #[test]
@@ -1550,7 +1770,8 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
-        assert!(orphaned.contains("tool-2"));
+        assert_eq!(orphaned.get("tool-2"), Some(&1));
+        assert!(!orphaned.contains_key("tool-3"));
     }
 
     #[test]
@@ -1604,7 +1825,7 @@ mod tests {
     fn test_validate_tool_pairing_duplicate_result() {
         use crate::kiro::model::requests::tool::ToolUseEntry;
 
-        // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
+        // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result，且没有新的 tool_use）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
             ToolUseEntry::new("tool-1", "read")
@@ -1641,11 +1862,61 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_tool_pairing_reused_tool_use_id() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // GPT 会跨轮复用 call_2：历史中 call_2 已配对，最新一轮又用 call_2，当前 result 必须保留
+        let mut assistant_msg1 = AssistantMessage::new("先读 settings");
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new(
+            "call_2",
+            "read_file",
+        )
+        .with_input(serde_json::json!({"path": "settings.json"}))]);
+
+        let mut user_result1 = UserMessage::new("", "gpt-5.6-luna");
+        user_result1 = user_result1.with_context(
+            UserInputMessageContext::new()
+                .with_tool_results(vec![ToolResult::error("call_2", "Access denied")]),
+        );
+
+        let mut assistant_msg2 = AssistantMessage::new("改读 workspace 文件");
+        assistant_msg2 = assistant_msg2.with_tool_uses(vec![ToolUseEntry::new(
+            "call_2",
+            "read_file",
+        )
+        .with_input(serde_json::json!({"path": "src/beautifier.js"}))]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new("测试工具", "gpt-5.6-luna")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg1,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: user_result1,
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg2,
+            }),
+        ];
+
+        let tool_results = vec![ToolResult::success("call_2", "file content ok")];
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+
+        assert_eq!(filtered.len(), 1, "复用 ID 的最新 tool_result 必须保留");
+        assert_eq!(filtered[0].tool_use_id, "call_2");
+        assert_eq!(
+            filtered[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("file content ok")
+        );
+        assert!(orphaned.is_empty(), "第二轮 call_2 应成功配对");
+    }
+
+    #[test]
     fn test_convert_assistant_message_tool_use_only() {
         use super::super::types::Message as AnthropicMessage;
 
         // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
-        // Kiro API 要求 content 字段不能为空
+        // 官方 Kiro 1.0.138 history：tool-only 轮 content 为空串
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -1653,16 +1924,13 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+                .expect("应该成功转换");
 
-        // 验证 content 不为空（使用占位符）
-        assert!(
-            !result.assistant_response_message.content.is_empty(),
-            "content 不应为空"
-        );
         assert_eq!(
-            result.assistant_response_message.content, " ",
-            "仅 tool_use 时应使用 ' ' 占位符"
+            result.assistant_response_message.content, "",
+            "仅 tool_use 时应使用空字符串 content"
         );
 
         // 验证 tool_uses 被正确保留
@@ -1688,7 +1956,9 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+                .expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -1725,9 +1995,9 @@ mod tests {
         ];
 
         // 移除 tool-1 和 tool-3
-        let mut orphaned = std::collections::HashSet::new();
-        orphaned.insert("tool-1".to_string());
-        orphaned.insert("tool-3".to_string());
+        let mut orphaned = std::collections::HashMap::new();
+        orphaned.insert("tool-1".to_string(), 1);
+        orphaned.insert("tool-3".to_string(), 1);
 
         remove_orphaned_tool_uses(&mut history, &orphaned);
 
@@ -1762,8 +2032,8 @@ mod tests {
             }),
         ];
 
-        let mut orphaned = std::collections::HashSet::new();
-        orphaned.insert("tool-1".to_string());
+        let mut orphaned = std::collections::HashMap::new();
+        orphaned.insert("tool-1".to_string(), 1);
 
         remove_orphaned_tool_uses(&mut history, &orphaned);
 
@@ -1801,7 +2071,9 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, "claude-sonnet-4.5", &mut HashMap::new())
+                .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
@@ -1816,6 +2088,283 @@ mod tests {
             .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_gpt_reasoning_content() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "...",
+                    "signature": ".KTR~~abc123"
+                },
+                {"type": "text", "text": "好的，我先读取文件。"},
+                {
+                    "type": "tool_use",
+                    "id": "call_2",
+                    "name": "read_file",
+                    "input": {"path": "src/main.rs"}
+                }
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, "gpt-5.6-luna", &mut HashMap::new()).expect("转换应成功");
+        let am = result.assistant_response_message;
+
+        // GPT 场景：thinking 不应嵌进 content，而应进入 reasoningContent
+        assert_eq!(am.content, "好的，我先读取文件。");
+        assert!(!am.content.contains("<thinking>"));
+
+        let rc = am.reasoning_content.expect("应有 reasoningContent");
+        assert_eq!(rc.reasoning_text.text, "...");
+        assert_eq!(rc.reasoning_text.signature, ".KTR~~abc123");
+
+        let tool_uses = am.tool_uses.expect("应有 tool_uses");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "call_2");
+    }
+
+    #[test]
+    fn test_convert_request_gpt_includes_reasoning_effort_fields() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, Thinking, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "gpt-5.6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("convert");
+        assert_eq!(result.agent_mode.as_deref(), Some("vibe"));
+        let fields = result
+            .additional_model_request_fields
+            .expect("GPT must send additionalModelRequestFields");
+        assert_eq!(fields["reasoning"]["effort"], "high");
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "gpt-5.6-luna"
+        );
+    }
+
+    #[test]
+    fn test_convert_assistant_message_gpt_tool_only_allows_empty_content() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 官方 GPT history: tool-only 轮 content 为 ""
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "Completed.",
+                    "signature": ".KTR~~t"
+                },
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "Bash",
+                    "input": {"command": "mkdir x"}
+                }
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, "gpt-5.6-luna", &mut HashMap::new()).expect("ok");
+        let am = result.assistant_response_message;
+        assert_eq!(am.content, "");
+        assert!(am.tool_uses.as_ref().map(|t| t.len() == 1).unwrap_or(false));
+        let rc = am.reasoning_content.expect("rc");
+        assert_eq!(rc.reasoning_text.text, "...");
+        assert_eq!(rc.reasoning_text.signature, ".KTR~~t");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_gpt_rewrites_completed_thinking_to_ellipsis() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 客户端侧展示过的 Completed. 回灌时还原为上游常见的 ...
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "Completed.",
+                    "signature": ".KTR~~xyz"
+                },
+                {"type": "text", "text": "Done."}
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, "gpt-5.6-luna", &mut HashMap::new()).expect("ok");
+        let am = result.assistant_response_message;
+        assert_eq!(am.content, "Done.");
+        let rc = am.reasoning_content.expect("reasoning");
+        assert_eq!(rc.reasoning_text.text, "...");
+        assert_eq!(rc.reasoning_text.signature, ".KTR~~xyz");
+    }
+
+    #[test]
+    fn test_process_message_content_filters_no_content_placeholder() {
+        let (text, images, tools) = process_message_content(&serde_json::json!([
+            {"type": "text", "text": "(no content)"},
+            {"type": "text", "text": "真实用户输入"}
+        ]))
+        .expect("ok");
+        assert_eq!(text, "真实用户输入");
+        assert!(images.is_empty());
+        assert!(tools.is_empty());
+
+        let (text2, _, _) =
+            process_message_content(&serde_json::json!("(no content)")).expect("ok");
+        assert_eq!(text2, "");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_claude_with_signature_uses_reasoning_content() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 官方 1.0.138 Claude Opus 4.8：有 signature 时走 reasoningContent，不嵌 <thinking>
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "plan",
+                    "signature": "EoYDsig"
+                },
+                {"type": "text", "text": "done"}
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, "claude-opus-4.8", &mut HashMap::new())
+                .expect("转换应成功");
+        let am = result.assistant_response_message;
+
+        assert_eq!(am.content, "done");
+        assert!(!am.content.contains("<thinking>"));
+        let rc = am.reasoning_content.expect("应有 reasoningContent");
+        assert_eq!(rc.reasoning_text.text, "plan");
+        assert_eq!(rc.reasoning_text.signature, "EoYDsig");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_claude_without_signature_keeps_thinking_in_content() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 无 signature 的旧路径：继续嵌 <thinking>（兼容旧客户端/历史）
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "plan"
+                },
+                {"type": "text", "text": "done"}
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+                .expect("转换应成功");
+        let am = result.assistant_response_message;
+
+        assert!(am.content.contains("<thinking>plan</thinking>"));
+        assert!(am.content.contains("done"));
+        assert!(am.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn test_convert_request_claude_includes_output_config_effort() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "medium".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("convert");
+        assert_eq!(result.agent_mode.as_deref(), Some("vibe"));
+        let fields = result
+            .additional_model_request_fields
+            .expect("Claude must send additionalModelRequestFields");
+        assert_eq!(fields["output_config"]["effort"], "medium");
+        assert!(fields.get("reasoning").is_none());
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-4.8"
+        );
+    }
+
+    
+    #[test]
+    fn test_haiku_omits_additional_model_request_fields() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "claude-haiku-4-5".to_string(),
+            max_tokens: 64,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+        let result = convert_request(&req).expect("haiku convert");
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "haiku must not send additionalModelRequestFields"
+        );
     }
 
     #[test]

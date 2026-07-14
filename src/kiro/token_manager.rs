@@ -6,6 +6,7 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -24,6 +25,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::user_agent;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -331,11 +333,8 @@ pub(crate) async fn get_usage_limits(
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
 
     // 构建 URL
     let mut url = format!(
@@ -349,11 +348,8 @@ pub(crate) async fn get_usage_limits(
     }
 
     // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let user_agent = user_agent::management_runtime_user_agent(config, &machine_id);
+    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(config, &machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -392,8 +388,9 @@ pub(crate) async fn get_usage_limits(
 
 /// 获取远程可用模型列表
 ///
-/// 调用 `https://q.{region}.amazonaws.com/ListAvailableModels` 接口，
-/// 与 `get_usage_limits` 使用相同的 host、鉴权头和代理配置。
+/// 调用 `https://management.{region}.kiro.dev` 控制面接口，
+/// 通过 `x-amz-target: KiroControlPlaneBearerService.ListAvailableModels`
+/// 获取远程可用模型列表。
 pub(crate) async fn list_available_models(
     credentials: &KiroCredentials,
     config: &Config,
@@ -401,38 +398,39 @@ pub(crate) async fn list_available_models(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<AvailableModelsResponse> {
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
 
-    let mut url = format!(
-        "https://{}/ListAvailableModels?origin=AI_EDITOR&maxResults=50",
-        host
-    );
+    let url = format!("https://{}", host);
+
+    let user_agent = user_agent::management_control_plane_user_agent(config, &machine_id);
+    let amz_user_agent = user_agent::management_control_plane_x_amz_user_agent(config, &machine_id);
+
+    let mut body = serde_json::json!({
+        "origin": "AI_EDITOR",
+    });
 
     if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+        body["profileArn"] = serde_json::Value::String(profile_arn.clone());
     }
-
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 30, config.tls_backend)?;
 
     let mut request = client
-        .get(&url)
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "KiroControlPlaneBearerService.ListAvailableModels",
+        )
         .header("x-amz-user-agent", &amz_user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+        .header("Connection", "close")
+        .json(&body);
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
@@ -448,6 +446,158 @@ pub(crate) async fn list_available_models(
 
     let data: AvailableModelsResponse = response.json().await?;
     Ok(data)
+}
+
+fn normalize_profile_arn(profile_arn: Option<&str>) -> Option<String> {
+    profile_arn
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<ListAvailableProfileItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfileItem {
+    #[serde(default)]
+    arn: Option<String>,
+}
+
+async fn list_available_profiles_once(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> Result<String, (bool, anyhow::Error)> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let user_agent = user_agent::management_runtime_user_agent(config, &machine_id);
+    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(config, &machine_id);
+
+    let client = build_client(proxy, 30, config.tls_backend).map_err(|e| (true, e))?;
+
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .json(&serde_json::json!({ "maxResults": 10 }));
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await.map_err(|e| (true, e.into()))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let retryable = matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS)
+            || status.is_server_error();
+        return Err((
+            retryable,
+            anyhow::anyhow!("ListAvailableProfiles 失败: {} {}", status, body_text),
+        ));
+    }
+
+    let data: ListAvailableProfilesResponse = response.json().await.map_err(|e| (false, e.into()))?;
+
+    for profile in data.profiles {
+        if let Some(profile_arn) = normalize_profile_arn(profile.arn.as_deref()) {
+            return Ok(profile_arn);
+        }
+    }
+
+    Err((
+        false,
+        anyhow::anyhow!("ListAvailableProfiles 返回空 profile 列表"),
+    ))
+}
+
+async fn list_available_profiles_with_retry(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<String> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut backoff_ms = 200u64;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match list_available_profiles_once(credentials, config, token, proxy).await {
+            Ok(profile_arn) => return Ok(profile_arn),
+            Err((retryable, err)) => {
+                if !retryable || attempt == MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    "ListAvailableProfiles 失败（尝试 {}/{}），准备重试: {}",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    err
+                );
+                tokio::time::sleep(StdDuration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(2000);
+            }
+        }
+    }
+
+    unreachable!("ListAvailableProfiles 重试循环应当总是返回")
+}
+
+async fn resolve_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    allow_refresh_fallback: bool,
+) -> anyhow::Result<(KiroCredentials, bool)> {
+    let mut resolved = credentials.clone();
+
+    if let Some(profile_arn) = normalize_profile_arn(resolved.profile_arn.as_deref()) {
+        let changed = resolved.profile_arn.as_deref() != Some(profile_arn.as_str());
+        resolved.profile_arn = Some(profile_arn);
+        return Ok((resolved, changed));
+    }
+
+    match list_available_profiles_with_retry(credentials, config, token, proxy).await {
+        Ok(profile_arn) => {
+            resolved.profile_arn = Some(profile_arn);
+            Ok((resolved, true))
+        }
+        Err(list_err) => {
+            if !allow_refresh_fallback {
+                return Err(anyhow::anyhow!("无法解析 profileArn: {}", list_err));
+            }
+
+            tracing::warn!(
+                "ListAvailableProfiles 未返回 profileArn，尝试通过刷新 Token 获取: {}",
+                list_err
+            );
+
+            let mut refreshed = refresh_token(credentials, config, proxy).await?;
+            let Some(profile_arn) = normalize_profile_arn(refreshed.profile_arn.as_deref()) else {
+                anyhow::bail!(
+                    "无法解析 profileArn：ListAvailableProfiles 失败，且 Token 刷新响应未返回 profileArn"
+                );
+            };
+            refreshed.profile_arn = Some(profile_arn);
+            Ok((refreshed, true))
+        }
+    }
 }
 
 // ============================================================================
@@ -949,9 +1099,32 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+
+            let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+            let (resolved_credentials, changed) = resolve_profile_arn(
+                credentials,
+                &self.config,
+                &token,
+                effective_proxy.as_ref(),
+                false,
+            )
+            .await?;
+
+            if changed {
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = resolved_credentials.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("profileArn 更新后持久化失败（不影响本次请求）: {}", e);
+                }
+            }
+
             return Ok(CallContext {
                 id,
-                credentials: credentials.clone(),
+                credentials: resolved_credentials,
                 token,
             });
         }
@@ -976,8 +1149,21 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
+                let mut new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+
+                let (resolved_creds, changed) = resolve_profile_arn(
+                    &new_creds,
+                    &self.config,
+                    new_creds
+                        .access_token
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("刷新后无 accessToken"))?,
+                    effective_proxy.as_ref(),
+                    false,
+                )
+                .await?;
+                new_creds = resolved_creds;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -992,8 +1178,11 @@ impl MultiTokenManager {
                 }
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                if changed {
+                    tracing::info!("凭据 #{} 已自动解析并缓存 profileArn", id);
+                }
                 if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    tracing::warn!("Token/profileArn 更新后持久化失败（不影响本次请求）: {}", e);
                 }
 
                 new_creds
@@ -1011,6 +1200,29 @@ impl MultiTokenManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
 
+        let effective_proxy = creds.effective_proxy(self.proxy.as_ref());
+        let (resolved_creds, changed) = resolve_profile_arn(
+            &creds,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+            true,
+        )
+        .await?;
+
+        if changed {
+            {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    entry.credentials = resolved_creds.clone();
+                }
+            }
+            tracing::info!("凭据 #{} 已自动解析并缓存 profileArn", id);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("profileArn 更新后持久化失败（不影响本次请求）: {}", e);
+            }
+        }
+
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1020,7 +1232,7 @@ impl MultiTokenManager {
 
         Ok(CallContext {
             id,
-            credentials: creds,
+            credentials: resolved_creds,
             token,
         })
     }
@@ -1660,6 +1872,28 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let (credentials, profile_changed) = resolve_profile_arn(
+            &credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+            true,
+        )
+        .await?;
+
+        if profile_changed {
+            {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    entry.credentials = credentials.clone();
+                }
+            }
+            tracing::info!("凭据 #{} 已自动解析并缓存 profileArn", id);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("profileArn 更新后持久化失败（不影响本次请求）: {}", e);
+            }
+        }
+
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
@@ -1925,6 +2159,19 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
+        let access_token = new_creds
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("刷新后无 accessToken"))?;
+        let (new_creds, profile_changed) = resolve_profile_arn(
+            &new_creds,
+            &self.config,
+            &access_token,
+            effective_proxy.as_ref(),
+            false,
+        )
+        .await?;
+
         // 更新 entries 中对应凭据
         {
             let mut entries = self.entries.lock();
@@ -1936,9 +2183,12 @@ impl MultiTokenManager {
 
         // 持久化
         if let Err(e) = self.persist_credentials() {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
+            tracing::warn!("强制刷新 Token/profileArn 后持久化失败: {}", e);
         }
 
+        if profile_changed {
+            tracing::info!("凭据 #{} 强制刷新后已自动解析并缓存 profileArn", id);
+        }
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
     }
@@ -2089,6 +2339,17 @@ mod tests {
             err_msg.contains("API Key 凭据不支持刷新"),
             "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn test_normalize_profile_arn() {
+        assert_eq!(normalize_profile_arn(None), None);
+        assert_eq!(normalize_profile_arn(Some("")), None);
+        assert_eq!(normalize_profile_arn(Some("   ")), None);
+        assert_eq!(
+            normalize_profile_arn(Some(" arn:aws:codewhisperer:profile/test ")),
+            Some("arn:aws:codewhisperer:profile/test".to_string())
         );
     }
 
@@ -2379,9 +2640,11 @@ mod tests {
         let mut cred1 = KiroCredentials::default();
         cred1.access_token = Some("t1".to_string());
         cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred1.profile_arn = Some("arn:aws:codewhisperer:profile/test-1".to_string());
         let mut cred2 = KiroCredentials::default();
         cred2.access_token = Some("t2".to_string());
         cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred2.profile_arn = Some("arn:aws:codewhisperer:profile/test-2".to_string());
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -2416,6 +2679,7 @@ mod tests {
         good_cred.priority = 1;
         good_cred.access_token = Some("good-token".to_string());
         good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        good_cred.profile_arn = Some("arn:aws:codewhisperer:profile/good".to_string());
 
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
@@ -2629,9 +2893,9 @@ mod tests {
 
         // 凭据.region 不参与 api_region 回退链
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "runtime.us-west-2.kiro.dev");
     }
 
     #[test]
@@ -2644,9 +2908,9 @@ mod tests {
         credentials.api_region = Some("eu-central-1".to_string());
 
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+        assert_eq!(api_host, "runtime.eu-central-1.kiro.dev");
     }
 
     #[test]

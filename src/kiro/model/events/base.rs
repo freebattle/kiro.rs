@@ -12,6 +12,8 @@ pub enum EventType {
     AssistantResponse,
     /// 工具使用事件
     ToolUse,
+    /// 推理内容事件（GPT 5.6 / Claude thinking）
+    ReasoningContent,
     /// 计费事件
     Metering,
     /// 上下文使用率事件
@@ -26,6 +28,7 @@ impl EventType {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             _ => Self::Unknown,
@@ -37,6 +40,7 @@ impl EventType {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Unknown => "unknown",
@@ -67,6 +71,8 @@ pub enum Event {
     AssistantResponse(super::AssistantResponseEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
+    /// 推理内容
+    ReasoningContent(super::ReasoningContentEvent),
     /// 计费
     Metering(super::MeteringEvent),
     /// 上下文使用率
@@ -115,6 +121,10 @@ impl Event {
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::Metering => {
                 let payload = super::MeteringEvent::from_frame(&frame)?;
@@ -170,6 +180,10 @@ mod tests {
             EventType::AssistantResponse
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::ReasoningContent
+        );
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
@@ -185,5 +199,9 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(
+            EventType::ReasoningContent.as_str(),
+            "reasoningContentEvent"
+        );
     }
 }

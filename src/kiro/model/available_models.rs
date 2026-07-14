@@ -40,6 +40,18 @@ pub struct RemoteModelInfo {
     #[serde(default)]
     pub rate_multiplier: Option<f64>,
 
+    /// 费率单位
+    #[serde(default)]
+    pub rate_unit: Option<String>,
+
+    /// Prompt Caching 能力
+    #[serde(default)]
+    pub prompt_caching: Option<PromptCaching>,
+
+    /// 附加请求字段 Schema
+    #[serde(default)]
+    pub additional_model_request_fields_schema: Option<serde_json::Value>,
+
     /// Token 限制
     #[serde(default)]
     pub token_limits: Option<TokenLimits>,
@@ -52,4 +64,17 @@ pub struct RemoteModelInfo {
 pub struct TokenLimits {
     pub max_input_tokens: Option<i64>,
     pub max_output_tokens: Option<i64>,
+}
+
+/// Prompt Caching 配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct PromptCaching {
+    #[serde(default)]
+    pub supports_prompt_caching: Option<bool>,
+    #[serde(default)]
+    pub minimum_tokens_per_cache_checkpoint: Option<i64>,
+    #[serde(default)]
+    pub maximum_cache_checkpoints_per_request: Option<i64>,
 }

@@ -1,6 +1,7 @@
 mod admin;
 mod admin_ui;
 mod anthropic;
+mod openai;
 mod common;
 mod debug_log;
 mod http_client;
@@ -192,6 +193,18 @@ async fn main() {
         });
     }
 
+    // 定期清理过期 Responses 持久化（默认 30 天 TTL）
+    {
+        let store = openai::ResponseStore::new("data/responses");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                store.purge_expired();
+            }
+        });
+    }
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
@@ -259,6 +272,7 @@ async fn main() {
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("  POST /v1/responses");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");

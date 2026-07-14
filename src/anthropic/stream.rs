@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::anthropic::converter::is_gpt_upstream_model;
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -553,6 +554,17 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 来自 reasoningContentEvent 的签名（GPT 5.6 多轮回灌需要）
+    pub reasoning_signature: Option<String>,
+    /// 来自 reasoningContentEvent 的文本
+    pub reasoning_text: Option<String>,
+    /// 是否已将来自 reasoningContentEvent 的内容作为 thinking 块对外输出
+    reasoning_event_emitted: bool,
+    /// GPT 整轮缓冲：官方 text→tool→reasoning，Anthropic 需要 thinking→text→tool
+    pending_gpt_text: String,
+    pending_gpt_tools: Vec<crate::kiro::model::events::ToolUseEvent>,
+    /// 是否已向客户端发出非空 text 或 tool_use（用于 GPT 空响应兜底）
+    has_emitted_visible_content: bool,
     /// 首字时间（从请求开始到第一个 AssistantResponse 事件的时间）
     ttft: Option<std::time::Instant>,
     /// 请求开始时间（用于计算 TTFT）
@@ -607,10 +619,166 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            reasoning_signature: None,
+            reasoning_text: None,
+            reasoning_event_emitted: false,
+            pending_gpt_text: String::new(),
+            pending_gpt_tools: Vec::new(),
+            has_emitted_visible_content: false,
             ttft: None,
             request_start,
             credits: 0.0,
         }
+    }
+
+    /// 是否应把上游 reasoningContentEvent 暴露为 Anthropic thinking 块
+    ///
+    /// GPT 必须外露 thinking：下一轮 history 回灌需要 signature。
+    /// 但可见文本 `...` 会被 Claude Code adaptive 当成未完成，因此展示文案
+    /// 会被改写为 `Completed.`（见 gpt_thinking_display_text）。
+    fn should_surface_reasoning_event(&self) -> bool {
+        if is_gpt_upstream_model(&self.model) {
+            return true;
+        }
+        self.thinking_enabled
+    }
+
+    fn is_gpt_model(&self) -> bool {
+        is_gpt_upstream_model(&self.model)
+    }
+
+    /// GPT 整轮缓冲，确保 thinking 在 text/tool 之前发出
+    fn should_buffer_for_gpt_reorder(&self) -> bool {
+        self.is_gpt_model()
+    }
+
+    /// GPT reasoning 的可见展示文案。
+    /// 上游常见 `...`，会触发 Claude Code adaptive 的 (no content) 续写。
+    fn gpt_thinking_display_text(&self) -> String {
+        match self.reasoning_text.as_deref().map(str::trim) {
+            None | Some("") | Some("...") => "Completed.".to_string(),
+            Some(text) => text.to_string(),
+        }
+    }
+
+    fn buffer_gpt_tool_use(&mut self, tool_use: &crate::kiro::model::events::ToolUseEvent) {
+        if let Some(existing) = self
+            .pending_gpt_tools
+            .iter_mut()
+            .find(|t| t.tool_use_id == tool_use.tool_use_id)
+        {
+            if !tool_use.input.is_empty() {
+                existing.input.push_str(&tool_use.input);
+            }
+            if !tool_use.name.is_empty() {
+                existing.name = tool_use.name.clone();
+            }
+            existing.stop = existing.stop || tool_use.stop;
+        } else {
+            self.pending_gpt_tools.push(crate::kiro::model::events::ToolUseEvent {
+                name: tool_use.name.clone(),
+                tool_use_id: tool_use.tool_use_id.clone(),
+                input: tool_use.input.clone(),
+                stop: tool_use.stop,
+            });
+        }
+        if !self.pending_gpt_tools.is_empty() {
+            self.state_manager.set_has_tool_use(true);
+        }
+    }
+
+    fn emit_buffered_gpt_thinking(&mut self) -> Vec<SseEvent> {
+        if self.reasoning_event_emitted {
+            return Vec::new();
+        }
+        if self.reasoning_signature.is_none() && self.reasoning_text.is_none() {
+            return Vec::new();
+        }
+        if !self.should_surface_reasoning_event() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        let thinking_index = self.state_manager.next_block_index();
+        self.thinking_block_index = Some(thinking_index);
+        self.reasoning_event_emitted = true;
+        self.thinking_extracted = true;
+
+        events.extend(self.state_manager.handle_content_block_start(
+            thinking_index,
+            "thinking",
+            json!({
+                "type": "content_block_start",
+                "index": thinking_index,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": ""
+                }
+            }),
+        ));
+
+        let thinking_text = self.gpt_thinking_display_text();
+        if !thinking_text.is_empty() {
+            self.output_tokens += estimate_tokens(&thinking_text);
+            events.push(self.create_thinking_delta_event(thinking_index, &thinking_text));
+        }
+
+        if let Some(sig) = self.reasoning_signature.clone() {
+            events.push(self.create_signature_delta_event(thinking_index, &sig));
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
+    fn flush_pending_gpt_text(&mut self) -> Vec<SseEvent> {
+        if self.pending_gpt_text.is_empty() {
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.pending_gpt_text);
+        self.create_text_delta_events(&text)
+    }
+
+    fn flush_pending_gpt_tools(&mut self) -> Vec<SseEvent> {
+        if self.pending_gpt_tools.is_empty() {
+            return Vec::new();
+        }
+        let tools = std::mem::take(&mut self.pending_gpt_tools);
+        let mut events = Vec::new();
+        for mut tool_use in tools {
+            tool_use.stop = true;
+            events.extend(self.emit_tool_use_events(&tool_use));
+        }
+        events
+    }
+
+    /// 按 Anthropic 顺序冲刷 GPT 整轮：thinking → text → tool
+    fn flush_gpt_reordered_turn(&mut self) -> Vec<SseEvent> {
+        if !self.should_buffer_for_gpt_reorder() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        events.extend(self.emit_buffered_gpt_thinking());
+        events.extend(self.flush_pending_gpt_text());
+        events.extend(self.flush_pending_gpt_tools());
+        events
+    }
+
+    /// GPT 纯 reasoning 轮：thinking 已带 Completed. 后仍可能被 adaptive 续写，
+    /// 补一个非空白 text，Claude Code 不会 strip 掉 "Done."。
+    fn ensure_gpt_non_empty_response(&mut self) -> Vec<SseEvent> {
+        if !self.is_gpt_model() {
+            return Vec::new();
+        }
+        if self.has_emitted_visible_content {
+            return Vec::new();
+        }
+        if self.reasoning_signature.is_none() && self.reasoning_text.is_none() {
+            // 完全空响应也兜底，避免 text='' 进入 history
+            return self.create_text_delta_events("Done.");
+        }
+        self.create_text_delta_events("Done.")
     }
 
     /// 记录首字时间
@@ -675,13 +843,13 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
+        // Claude thinking 标签路径 / GPT 整轮重排：不在这里预建 text 块，
+        // 避免破坏 thinking → text 顺序。
+        if self.thinking_enabled || self.should_buffer_for_gpt_reorder() {
             return events;
         }
 
-        // 创建初始文本块（仅在未启用 thinking 时）
+        // 创建初始文本块
         let text_block_index = self.state_manager.next_block_index();
         self.text_block_index = Some(text_block_index);
         let text_block_events = self.state_manager.handle_content_block_start(
@@ -711,6 +879,10 @@ impl StreamContext {
             Event::ToolUse(tool_use) => {
                 self.mark_first_token();
                 self.process_tool_use(tool_use)
+            }
+            Event::ReasoningContent(reasoning) => {
+                self.mark_first_token();
+                self.process_reasoning_content(reasoning)
             }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -764,6 +936,12 @@ impl StreamContext {
 
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
+
+        // GPT：缓冲 text，等 reasoning 到达后按 thinking→text→tool 冲刷。
+        if self.should_buffer_for_gpt_reorder() {
+            self.pending_gpt_text.push_str(content);
+            return Vec::new();
+        }
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -978,6 +1156,10 @@ impl StreamContext {
             events.push(delta_event);
         }
 
+        if !text.is_empty() {
+            self.has_emitted_visible_content = true;
+        }
+
         events
     }
 
@@ -996,14 +1178,155 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件（Anthropic thinking signature）
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
+    /// 处理上游 reasoningContentEvent
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        if let Some(text) = reasoning.text.as_ref() {
+            if !text.is_empty() {
+                self.reasoning_text = Some(text.clone());
+            }
+        }
+        if let Some(sig) = reasoning.signature.as_ref() {
+            if !sig.trim().is_empty() {
+                self.reasoning_signature = Some(sig.clone());
+            }
+        }
+
+        // GPT：reasoning 到达后立刻按 thinking→text→tool 冲刷（避免 Stream stalled）
+        if self.should_buffer_for_gpt_reorder() {
+            return self.flush_gpt_reordered_turn();
+        }
+
+        // 无签名也无文本时不对外输出（避免空 thinking 块）
+        if self.reasoning_signature.is_none() && self.reasoning_text.is_none() {
+            return Vec::new();
+        }
+        if !self.should_surface_reasoning_event() {
+            return Vec::new();
+        }
+
+        // 已通过 <thinking> 标签路径输出过，只缓存 signature 供回灌，不再重复开块
+        if self.thinking_block_index.is_some() && !self.reasoning_event_emitted {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        if !self.reasoning_event_emitted {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            self.reasoning_event_emitted = true;
+            self.thinking_extracted = true;
+
+            let start_events = self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }),
+            );
+            events.extend(start_events);
+
+            let thinking_text = self
+                .reasoning_text
+                .clone()
+                .unwrap_or_else(|| "...".to_string());
+            if !thinking_text.is_empty() {
+                self.output_tokens += estimate_tokens(&thinking_text);
+                events.push(self.create_thinking_delta_event(thinking_index, &thinking_text));
+            }
+
+            // signature 齐了就立刻关闭 thinking 块；否则等后续事件/收尾再关
+            if let Some(sig) = self.reasoning_signature.clone() {
+                events.push(self.create_signature_delta_event(thinking_index, &sig));
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
+                }
+            }
+        } else if let (Some(thinking_index), Some(sig)) =
+            (self.thinking_block_index, self.reasoning_signature.clone())
+        {
+            // 补发 signature 并关闭（处理 text/signature 分片到达）
+            if self
+                .state_manager
+                .is_block_open_of_type(thinking_index, "thinking")
+            {
+                events.push(self.create_signature_delta_event(thinking_index, &sig));
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
+                }
+            }
+        }
+
+        events
+    }
+
+    /// 关闭仍未关闭的 event-based reasoning thinking 块
+    fn finalize_open_reasoning_thinking(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.reasoning_event_emitted {
+            return events;
+        }
+        let Some(thinking_index) = self.thinking_block_index else {
+            return events;
+        };
+        if !self
+            .state_manager
+            .is_block_open_of_type(thinking_index, "thinking")
+        {
+            return events;
+        }
+
+        if let Some(sig) = self.reasoning_signature.clone() {
+            events.push(self.create_signature_delta_event(thinking_index, &sig));
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
+        // GPT：缓冲 tool_use，等 reasoning 后按正确顺序发出
+        if self.should_buffer_for_gpt_reorder() {
+            self.buffer_gpt_tool_use(tool_use);
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
-        self.state_manager.set_has_tool_use(true);
+        // tool_use 前先关闭未完成的 event-based reasoning thinking 块
+        events.extend(self.finalize_open_reasoning_thinking());
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1056,6 +1379,19 @@ impl StreamContext {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
         }
+
+        events.extend(self.emit_tool_use_events(tool_use));
+        events
+    }
+
+    /// 实际发出 tool_use SSE 事件（Claude 实时路径 + GPT 重排 flush 共用）
+    fn emit_tool_use_events(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        self.state_manager.set_has_tool_use(true);
+        self.has_emitted_visible_content = true;
 
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
@@ -1124,6 +1460,13 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // GPT：冲刷整轮缓冲；Claude：关闭仍打开的 event-based reasoning thinking
+        events.extend(self.flush_gpt_reordered_turn());
+        events.extend(self.finalize_open_reasoning_thinking());
+
+        // GPT 无 text/tool 时补非空白 text，避免 text='' / (no content) 死循环
+        events.extend(self.ensure_gpt_non_empty_response());
+
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
             if self.in_thinking_block {
@@ -1186,11 +1529,13 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // Claude 标签路径：整个流只有 thinking、没有 text/tool 时，
+        // 视作 thinking 预算耗尽（max_tokens），并补一个空格 text 块保持协议兼容。
+        // GPT event-based reasoning 不能走这条路径：官方常见“纯 reasoning + END_TURN”，
+        // 若标 max_tokens，Claude Code 会无限发送 `(no content)` 续写。
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
+            && !self.reasoning_event_emitted
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
@@ -1995,5 +2340,181 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    #[test]
+    fn test_gpt_rewrites_ellipsis_thinking_and_preserves_signature() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+
+        // GPT 必须外露 thinking+signature 供下一轮回灌；
+        // 可见文案把 `...` 改写为 Completed.，避免 adaptive 续写。
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-luna", 1, 0, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "先读文件"})).unwrap();
+        let early = ctx.process_kiro_event(&Event::AssistantResponse(assistant));
+        assert!(
+            early.iter().all(|e| e.event != "content_block_delta"),
+            "GPT text should buffer until reasoning arrives"
+        );
+        all.extend(early);
+
+        let reasoning: ReasoningContentEvent = serde_json::from_value(serde_json::json!({
+            "text": "...",
+            "signature": ".KTR~~sig"
+        }))
+        .unwrap();
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(reasoning)));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "Completed.");
+        assert_eq!(collect_text_content(&all), "先读文件");
+        assert_eq!(ctx.reasoning_signature.as_deref(), Some(".KTR~~sig"));
+
+        let signatures: Vec<_> = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|e| e.data["delta"]["signature"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(signatures, vec![".KTR~~sig".to_string()]);
+
+        let first_thinking = all.iter().position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+        });
+        let first_text = all.iter().position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        });
+        assert!(first_thinking.is_some() && first_text.is_some() && first_thinking < first_text);
+
+        let message_delta = all
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_gpt_reorder_thinking_before_text_and_tool() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent, ToolUseEvent};
+
+        // GPT 官方：text → tool → reasoning；Anthropic：thinking → text → tool
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-luna", 1, 0, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "准备读取文件"})).unwrap();
+        all.extend(ctx.process_kiro_event(&Event::AssistantResponse(assistant)));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Read".into(),
+            tool_use_id: "call_2".into(),
+            input: r#"{"file_path":"a.rs"}"#.into(),
+            stop: true,
+        })));
+
+        assert!(
+            all.iter().all(|e| e.event != "content_block_start"),
+            "GPT content must stay buffered until reasoning arrives"
+        );
+
+        let reasoning: ReasoningContentEvent = serde_json::from_value(serde_json::json!({
+            "text": "...",
+            "signature": ".KTR~~tool"
+        }))
+        .unwrap();
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(reasoning)));
+        all.extend(ctx.generate_final_events());
+
+        let starts: Vec<String> = all
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["content_block"]["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            starts,
+            vec!["thinking".to_string(), "text".to_string(), "tool_use".to_string()],
+            "final content order must be thinking → text → tool, got {:?}",
+            starts
+        );
+
+        let message_delta = all
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+        assert_eq!(collect_text_content(&all), "准备读取文件");
+        assert_eq!(collect_thinking_content(&all), "Completed.");
+    }
+
+    #[test]
+    fn test_gpt_reasoning_only_uses_end_turn_not_max_tokens() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+
+        // GPT 纯 reasoning：thinking=Completed. + text=Done. + end_turn
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-luna", 1, 0, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        let reasoning: ReasoningContentEvent = serde_json::from_value(serde_json::json!({
+            "text": "...",
+            "signature": ".KTR~~only"
+        }))
+        .unwrap();
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(reasoning)));
+        all.extend(ctx.generate_final_events());
+
+        let message_delta = all
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "end_turn",
+            "GPT reasoning-only must be end_turn, got {}",
+            message_delta.data["delta"]["stop_reason"]
+        );
+
+        assert_eq!(collect_thinking_content(&all), "Completed.");
+        assert_eq!(collect_text_content(&all), "Done.");
+    }
+
+    #[test]
+    fn test_gpt_text_without_reasoning_flushed_at_end() {
+        use crate::kiro::model::events::Event;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-luna", 1, 0, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "纯文本回答"})).unwrap();
+        all.extend(ctx.process_kiro_event(&Event::AssistantResponse(assistant)));
+        // 缓冲中，尚无 text 输出
+        assert_eq!(collect_text_content(&all), "");
+        all.extend(ctx.generate_final_events());
+        assert_eq!(collect_text_content(&all), "纯文本回答");
+    }
+
+    #[test]
+    fn test_reasoning_content_event_without_thinking_disabled_for_claude() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+
+        // Claude 且未开启 thinking 时，不把 reasoningContentEvent 暴露为 thinking 块
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.5", 1, 0, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let reasoning_json = serde_json::json!({"signature": "EoYDsig"});
+        let reasoning: ReasoningContentEvent = serde_json::from_value(reasoning_json).unwrap();
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(reasoning));
+        assert!(events.is_empty());
+        assert_eq!(ctx.reasoning_signature.as_deref(), Some("EoYDsig"));
     }
 }
