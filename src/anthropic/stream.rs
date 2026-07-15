@@ -1203,10 +1203,9 @@ impl StreamContext {
                 self.reasoning_text = Some(text.clone());
             }
         }
-        if let Some(sig) = reasoning.signature.as_ref() {
-            if !sig.trim().is_empty() {
-                self.reasoning_signature = Some(sig.clone());
-            }
+        // IDE: signature；CLI GPT: redactedContent（整段 blob 当 signature 回灌）
+        if let Some(sig) = reasoning.effective_signature() {
+            self.reasoning_signature = Some(sig.to_string());
         }
 
         // GPT：reasoning 到达后立刻按 thinking→text→tool 冲刷（避免 Stream stalled）

@@ -6,13 +6,10 @@
     { "key": "sk-user-alice-abc123", "name": "alice" },
     { "key": "sk-user-bob-def456", "name": "bob" }
   ],
-  "tlsBackend": "rustls",
-  "region": "us-east-1",
-  "kiroVersion": "1.0.138",
-  "nodeVersion": "22.22.0",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
   "loadBalancingMode": "priority",
-  "extractThinking": true,
-  "includeOpenSourceModels": false
+  "includeOpenSourceModels": false,
+  "proxyUrl": null,
+  "debugLogDir": null
 }

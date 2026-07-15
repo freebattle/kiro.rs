@@ -81,7 +81,7 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
-    /// 是否开启非流式响应的 thinking 块提取
+    /// 是否开启非流式响应的 thinking 块提取（固定开启）
     pub extract_thinking: bool,
     /// 请求记录存储
     pub request_log: RequestLogStore,
@@ -99,14 +99,13 @@ impl AppState {
     /// 创建新的应用状态
     pub fn new(
         api_key: impl Into<String>,
-        extract_thinking: bool,
         request_log: RequestLogStore,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             api_keys: Vec::new(),
             kiro_provider: None,
-            extract_thinking,
+            extract_thinking: true,
             request_log,
             prompt_cache: Arc::new(PromptCacheTracker::new()),
             debug_logger: OptionalDebugLogger::none(),

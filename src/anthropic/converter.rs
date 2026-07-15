@@ -2157,8 +2157,9 @@ mod tests {
         assert!(!am.content.contains("<thinking>"));
 
         let rc = am.reasoning_content.expect("应有 reasoningContent");
-        assert_eq!(rc.reasoning_text.text, "...");
-        assert_eq!(rc.reasoning_text.signature, ".KTR~~abc123");
+        let rt = rc.reasoning_text.expect("rt");
+        assert_eq!(rt.text, "...");
+        assert_eq!(rt.signature, ".KTR~~abc123");
 
         let tool_uses = am.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
@@ -2234,8 +2235,9 @@ mod tests {
         assert_eq!(am.content, "");
         assert!(am.tool_uses.as_ref().map(|t| t.len() == 1).unwrap_or(false));
         let rc = am.reasoning_content.expect("rc");
-        assert_eq!(rc.reasoning_text.text, "...");
-        assert_eq!(rc.reasoning_text.signature, ".KTR~~t");
+        let rt = rc.reasoning_text.expect("rt");
+        assert_eq!(rt.text, "...");
+        assert_eq!(rt.signature, ".KTR~~t");
     }
 
     #[test]
@@ -2260,8 +2262,9 @@ mod tests {
         let am = result.assistant_response_message;
         assert_eq!(am.content, "Done.");
         let rc = am.reasoning_content.expect("reasoning");
-        assert_eq!(rc.reasoning_text.text, "...");
-        assert_eq!(rc.reasoning_text.signature, ".KTR~~xyz");
+        let rt = rc.reasoning_text.expect("rt");
+        assert_eq!(rt.text, "...");
+        assert_eq!(rt.signature, ".KTR~~xyz");
     }
 
     #[test]
@@ -2305,8 +2308,9 @@ mod tests {
         assert_eq!(am.content, "done");
         assert!(!am.content.contains("<thinking>"));
         let rc = am.reasoning_content.expect("应有 reasoningContent");
-        assert_eq!(rc.reasoning_text.text, "plan");
-        assert_eq!(rc.reasoning_text.signature, "EoYDsig");
+        let rt = rc.reasoning_text.expect("rt");
+        assert_eq!(rt.text, "plan");
+        assert_eq!(rt.signature, "EoYDsig");
     }
 
     #[test]

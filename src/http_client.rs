@@ -1,11 +1,10 @@
 //! HTTP Client 构建模块
 //!
-//! 提供统一的 HTTP Client 构建功能，支持代理配置
+//! 提供统一的 HTTP Client 构建功能，支持代理配置。
+//! TLS 固定使用 rustls（程序内常量，不暴露用户配置）。
 
 use reqwest::{Client, Proxy};
 use std::time::Duration;
-
-use crate::model::config::TlsBackend;
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -41,36 +40,14 @@ impl ProxyConfig {
 /// # Arguments
 /// * `proxy` - 可选的代理配置
 /// * `timeout_secs` - 超时时间（秒）
-///
-/// # Returns
-/// 配置好的 reqwest::Client
-pub fn build_client(
-    proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
-    tls_backend: TlsBackend,
-) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
-
-    match tls_backend {
-        TlsBackend::Rustls => {
-            builder = builder.use_rustls_tls();
-        }
-        TlsBackend::NativeTls => {
-            #[cfg(feature = "native-tls")]
-            {
-                builder = builder.use_native_tls();
-            }
-            #[cfg(not(feature = "native-tls"))]
-            {
-                anyhow::bail!("此构建版本未包含 native-tls 后端，请在配置中改用 rustls");
-            }
-        }
-    }
+pub fn build_client(proxy: Option<&ProxyConfig>, timeout_secs: u64) -> anyhow::Result<Client> {
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .use_rustls_tls();
 
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
-        // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
             proxy = proxy.basic_auth(username, password);
         }
@@ -104,14 +81,14 @@ mod tests {
 
     #[test]
     fn test_build_client_without_proxy() {
-        let client = build_client(None, 30, TlsBackend::Rustls);
+        let client = build_client(None, 30);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
-        let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        let client = build_client(Some(&config), 30);
         assert!(client.is_ok());
     }
 }

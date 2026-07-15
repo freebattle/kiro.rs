@@ -104,7 +104,7 @@ pub struct AddCredentialRequest {
     pub priority: u32,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
-    /// 未配置时回退到 config.json 的全局 region
+    /// 未配置时回退到程序默认 us-east-1
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
@@ -114,7 +114,7 @@ pub struct AddCredentialRequest {
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
-    /// 未配置时回退到 config.json 的 machineId
+    /// 未配置时由 refreshToken / kiroApiKey 派生
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）

@@ -37,7 +37,7 @@ pub(crate) async fn call_stream_api() -> anyhow::Result<()> {
 
     // 加载配置
     let config = Config::load_default()?;
-    println!("API 区域: {}", config.region);
+    println!("API 区域: {}", crate::model::config::DEFAULT_REGION);
 
     // 创建 TokenManager 和 KiroProvider
     let token_manager = TokenManager::new(config, credentials);

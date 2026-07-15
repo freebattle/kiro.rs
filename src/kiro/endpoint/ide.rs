@@ -26,7 +26,7 @@ impl IdeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+        ctx.credentials.effective_api_region()
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
@@ -34,11 +34,11 @@ impl IdeEndpoint {
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        user_agent::runtime_streaming_x_amz_user_agent(ctx.config, ctx.machine_id)
+        user_agent::runtime_streaming_x_amz_user_agent(ctx.machine_id)
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        user_agent::runtime_streaming_user_agent(ctx.config, ctx.machine_id)
+        user_agent::runtime_streaming_user_agent(ctx.machine_id)
     }
 
     /// 官方 Kiro 1.0.138 使用 `TokenType` 头：

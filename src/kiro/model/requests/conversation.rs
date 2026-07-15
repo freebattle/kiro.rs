@@ -8,33 +8,61 @@ use super::tool::{Tool, ToolResult, ToolUseEntry};
 
 /// 历史助手消息中的推理内容
 ///
-/// GPT 5.6 上游要求在后续请求 history 中回灌 reasoningContent。
+/// 上游要求在后续请求 history 中回灌 reasoningContent。两种形态：
+/// - IDE / Claude：`reasoningText: { text, signature }`
+/// - CLI GPT：`redactedContent: "...blob..."`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningContent {
-    /// 推理文本包装
-    pub reasoning_text: ReasoningText,
+    /// 推理文本包装（Claude / IDE GPT）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<ReasoningText>,
+    /// CLI GPT 使用的 redact blob
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_content: Option<String>,
 }
 
 /// 推理文本与签名
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningText {
-    /// 推理文本（GPT 常为 `"..."` 占位）
+    /// 推理文本（GPT IDE 常为 `"..."` 占位）
     pub text: String,
     /// 推理签名，需原样回传
     pub signature: String,
 }
 
 impl ReasoningContent {
-    /// 从文本和签名创建推理内容
+    /// 从文本和签名创建推理内容（IDE / Claude 形态）
     pub fn new(text: impl Into<String>, signature: impl Into<String>) -> Self {
         Self {
-            reasoning_text: ReasoningText {
+            reasoning_text: Some(ReasoningText {
                 text: text.into(),
                 signature: signature.into(),
-            },
+            }),
+            redacted_content: None,
         }
+    }
+
+    /// CLI GPT 的 redacted 形态
+    pub fn redacted(blob: impl Into<String>) -> Self {
+        Self {
+            reasoning_text: None,
+            redacted_content: Some(blob.into()),
+        }
+    }
+
+    /// 取可回灌签名 / blob（优先 reasoningText.signature，否则 redactedContent）
+    pub fn signature_blob(&self) -> Option<&str> {
+        if let Some(rt) = &self.reasoning_text {
+            if !rt.signature.trim().is_empty() {
+                return Some(rt.signature.as_str());
+            }
+        }
+        self.redacted_content
+            .as_ref()
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -428,6 +456,7 @@ mod tests {
             json["reasoningContent"]["reasoningText"]["signature"],
             ".KTR~~sig"
         );
+        assert!(json["reasoningContent"].get("redactedContent").is_none());
     }
 
     #[test]
@@ -442,7 +471,25 @@ mod tests {
         let msg: AssistantMessage = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.content, "ok");
         let rc = msg.reasoning_content.unwrap();
-        assert_eq!(rc.reasoning_text.text, "...");
-        assert_eq!(rc.reasoning_text.signature, ".KTR~~abc");
+        let rt = rc.reasoning_text.unwrap();
+        assert_eq!(rt.text, "...");
+        assert_eq!(rt.signature, ".KTR~~abc");
+    }
+
+    #[test]
+    fn test_assistant_message_redacted_reasoning_roundtrip() {
+        let raw = r#"{
+            "content": "ok",
+            "reasoningContent": { "redactedContent": "LktUUn5+blob" }
+        }"#;
+        let msg: AssistantMessage = serde_json::from_str(raw).unwrap();
+        let rc = msg.reasoning_content.unwrap();
+        assert_eq!(rc.redacted_content.as_deref(), Some("LktUUn5+blob"));
+        assert!(rc.reasoning_text.is_none());
+        assert_eq!(rc.signature_blob(), Some("LktUUn5+blob"));
+
+        let ser = serde_json::to_value(ReasoningContent::redacted("LktUUn5+blob")).unwrap();
+        assert_eq!(ser["redactedContent"], "LktUUn5+blob");
+        assert!(ser.get("reasoningText").is_none());
     }
 }

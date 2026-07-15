@@ -151,14 +151,13 @@ async fn refresh_social_token(
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
-    let region = credentials.effective_auth_region(config);
+    let region = credentials.effective_auth_region();
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    
+    let client = build_client(proxy, 60)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -169,7 +168,7 @@ async fn refresh_social_token(
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
+            format!("KiroIDE-{}-{}", crate::model::config::KIRO_VERSION, machine_id),
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
@@ -243,10 +242,10 @@ async fn refresh_idc_token(
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
 
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
-    let region = credentials.effective_auth_region(config);
+    let region = credentials.effective_auth_region();
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    let os_name = crate::model::config::SYSTEM_VERSION;
+    let node_version = crate::model::config::NODE_VERSION;
 
     let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
     let user_agent = format!(
@@ -254,7 +253,7 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, 60)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -332,7 +331,7 @@ pub(crate) async fn get_usage_limits(
     tracing::debug!("正在获取使用额度信息...");
 
     // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
+    let region = credentials.effective_api_region();
     let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
 
@@ -348,10 +347,10 @@ pub(crate) async fn get_usage_limits(
     }
 
     // 构建 User-Agent headers
-    let user_agent = user_agent::management_runtime_user_agent(config, &machine_id);
-    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(config, &machine_id);
+    let user_agent = user_agent::management_runtime_user_agent(&machine_id);
+    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(&machine_id);
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, 60)?;
 
     let mut request = client
         .get(&url)
@@ -397,14 +396,14 @@ pub(crate) async fn list_available_models(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<AvailableModelsResponse> {
-    let region = credentials.effective_api_region(config);
+    let region = credentials.effective_api_region();
     let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
 
     let url = format!("https://{}", host);
 
-    let user_agent = user_agent::management_control_plane_user_agent(config, &machine_id);
-    let amz_user_agent = user_agent::management_control_plane_x_amz_user_agent(config, &machine_id);
+    let user_agent = user_agent::management_control_plane_user_agent(&machine_id);
+    let amz_user_agent = user_agent::management_control_plane_x_amz_user_agent(&machine_id);
 
     let mut body = serde_json::json!({
         "origin": "AI_EDITOR",
@@ -414,7 +413,7 @@ pub(crate) async fn list_available_models(
         body["profileArn"] = serde_json::Value::String(profile_arn.clone());
     }
 
-    let client = build_client(proxy, 30, config.tls_backend)?;
+    let client = build_client(proxy, 30)?;
 
     let mut request = client
         .post(&url)
@@ -475,14 +474,14 @@ async fn list_available_profiles_once(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> Result<String, (bool, anyhow::Error)> {
-    let region = credentials.effective_api_region(config);
+    let region = credentials.effective_api_region();
     let host = format!("management.{}.kiro.dev", region);
     let url = format!("https://{}/ListAvailableProfiles", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let user_agent = user_agent::management_runtime_user_agent(config, &machine_id);
-    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(config, &machine_id);
+    let user_agent = user_agent::management_runtime_user_agent(&machine_id);
+    let amz_user_agent = user_agent::management_runtime_x_amz_user_agent(&machine_id);
 
-    let client = build_client(proxy, 30, config.tls_backend).map_err(|e| (true, e))?;
+    let client = build_client(proxy, 30).map_err(|e| (true, e))?;
 
     let mut request = client
         .post(&url)
@@ -2794,12 +2793,11 @@ mod tests {
     fn test_credential_region_priority_uses_credential_auth_region() {
         // 凭据配置了 auth_region 时，应使用凭据的 auth_region
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.auth_region = Some("eu-west-1".to_string());
 
-        let region = credentials.effective_auth_region(&config);
+        let region = credentials.effective_auth_region();
         assert_eq!(region, "eu-west-1");
     }
 
@@ -2807,34 +2805,29 @@ mod tests {
     fn test_credential_region_priority_fallback_to_credential_region() {
         // 凭据未配置 auth_region 但配置了 region 时，应回退到凭据.region
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-central-1".to_string());
 
-        let region = credentials.effective_auth_region(&config);
+        let region = credentials.effective_auth_region();
         assert_eq!(region, "eu-central-1");
     }
 
     #[test]
-    fn test_credential_region_priority_fallback_to_config() {
-        // 凭据未配置 auth_region 和 region 时，应回退到 config
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
+    fn test_credential_region_priority_fallback_to_default() {
+        // 凭据未配置 auth_region 和 region 时，回退到程序默认 us-east-1
         let credentials = KiroCredentials::default();
         assert!(credentials.auth_region.is_none());
         assert!(credentials.region.is_none());
 
-        let region = credentials.effective_auth_region(&config);
-        assert_eq!(region, "us-west-2");
+        let region = credentials.effective_auth_region();
+        assert_eq!(region, crate::model::config::DEFAULT_REGION);
     }
 
     #[test]
     fn test_multiple_credentials_use_respective_regions() {
         // 多凭据场景下，不同凭据使用各自的 auth_region
         let mut config = Config::default();
-        config.region = "ap-northeast-1".to_string();
 
         let mut cred1 = KiroCredentials::default();
         cred1.auth_region = Some("us-east-1".to_string());
@@ -2844,21 +2837,20 @@ mod tests {
 
         let cred3 = KiroCredentials::default(); // 无 region，使用 config
 
-        assert_eq!(cred1.effective_auth_region(&config), "us-east-1");
-        assert_eq!(cred2.effective_auth_region(&config), "eu-west-1");
-        assert_eq!(cred3.effective_auth_region(&config), "ap-northeast-1");
+        assert_eq!(cred1.effective_auth_region(), "us-east-1");
+        assert_eq!(cred2.effective_auth_region(), "eu-west-1");
+        assert_eq!(cred3.effective_auth_region(), crate::model::config::DEFAULT_REGION);
     }
 
     #[test]
     fn test_idc_oidc_endpoint_uses_credential_auth_region() {
         // 验证 IdC OIDC endpoint URL 使用凭据 auth_region
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.auth_region = Some("eu-central-1".to_string());
 
-        let region = credentials.effective_auth_region(&config);
+        let region = credentials.effective_auth_region();
         let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
         assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
@@ -2868,12 +2860,11 @@ mod tests {
     fn test_social_refresh_endpoint_uses_credential_auth_region() {
         // 验证 Social refresh endpoint URL 使用凭据 auth_region
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.auth_region = Some("ap-southeast-1".to_string());
 
-        let region = credentials.effective_auth_region(&config);
+        let region = credentials.effective_auth_region();
         let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
 
         assert_eq!(
@@ -2884,30 +2875,25 @@ mod tests {
 
     #[test]
     fn test_api_call_uses_effective_api_region() {
-        // 验证 API 调用使用 effective_api_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
+        // 验证 API 调用使用 effective_api_region（含凭据.region 回退）
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-west-1".to_string());
 
-        // 凭据.region 不参与 api_region 回退链
-        let api_region = credentials.effective_api_region(&config);
+        let api_region = credentials.effective_api_region();
         let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "runtime.us-west-2.kiro.dev");
+        assert_eq!(api_host, "runtime.eu-west-1.kiro.dev");
     }
 
     #[test]
     fn test_api_call_uses_credential_api_region() {
         // 凭据配置了 api_region 时，API 调用应使用凭据的 api_region
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.api_region = Some("eu-central-1".to_string());
 
-        let api_region = credentials.effective_api_region(&config);
+        let api_region = credentials.effective_api_region();
         let api_host = format!("runtime.{}.kiro.dev", api_region);
 
         assert_eq!(api_host, "runtime.eu-central-1.kiro.dev");
@@ -2917,12 +2903,11 @@ mod tests {
     fn test_credential_region_empty_string_treated_as_set() {
         // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
         let mut config = Config::default();
-        config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.auth_region = Some("".to_string());
 
-        let region = credentials.effective_auth_region(&config);
+        let region = credentials.effective_auth_region();
         // 空字符串被视为已设置，不会回退到 config
         assert_eq!(region, "");
     }
@@ -2931,13 +2916,12 @@ mod tests {
     fn test_auth_and_api_region_independent() {
         // auth_region 和 api_region 互不影响
         let mut config = Config::default();
-        config.region = "default".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.auth_region = Some("auth-only".to_string());
         credentials.api_region = Some("api-only".to_string());
 
-        assert_eq!(credentials.effective_auth_region(&config), "auth-only");
-        assert_eq!(credentials.effective_api_region(&config), "api-only");
+        assert_eq!(credentials.effective_auth_region(), "auth-only");
+        assert_eq!(credentials.effective_api_region(), "api-only");
     }
 }

@@ -812,15 +812,14 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ReasoningContent(reasoning) => {
-                            if let Some(text) = reasoning.text {
+                            if let Some(ref text) = reasoning.text {
                                 if !text.is_empty() {
-                                    reasoning_text = Some(text);
+                                    reasoning_text = Some(text.clone());
                                 }
                             }
-                            if let Some(sig) = reasoning.signature {
-                                if !sig.trim().is_empty() {
-                                    reasoning_signature = Some(sig);
-                                }
+                            // IDE signature / CLI GPT redactedContent
+                            if let Some(sig) = reasoning.effective_signature() {
+                                reasoning_signature = Some(sig.to_string());
                             }
                         }
                         Event::ContextUsage(context_usage) => {

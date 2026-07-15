@@ -5,14 +5,20 @@
 //!
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
+//!
+//! 切换方式：
+//! - 全局：`config.defaultEndpoint = "ide" | "cli"`
+//! - 凭据级：`credentials[].endpoint = "ide" | "cli"`
 
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点

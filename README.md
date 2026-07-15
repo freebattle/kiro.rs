@@ -12,8 +12,7 @@
 
 ## 注意！
 
-因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
-如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
+HTTPS 固定使用 **rustls**。若代理/企业证书环境异常，请安装系统 CA（Linux: `ca-certificates`）或检查代理本身，无需再配置 TLS 后端。
 
 **Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
 
@@ -259,9 +258,7 @@ cargo build --release
 |----|------|
 | `host` | 本机反代后仅本地访问用 `127.0.0.1`；直接对外或 Docker 用 `0.0.0.0` |
 | 工作目录 | 进程 cwd 决定 `./data/usage_stats`、`data/responses` 位置，systemd 请设 `WorkingDirectory` |
-| `systemVersion` | 可填 `linux#6.x.x`，不填则随机 `darwin`/`win32` 标识（仅 UA，一般无妨） |
-| `kiroVersion` | 默认 `1.0.138`，建议保持与当前协议一致 |
-| TLS / 代理 | 出问题优先试 `tlsBackend: "native-tls"`，并确保系统 CA 正常（`ca-certificates`） |
+| TLS / 代理 | 固定 rustls；代理出问题优先检查 `proxyUrl` 与系统 CA（`ca-certificates`） |
 | 防火墙 | 放行业务端口，或只走 Nginx/Caddy 反代 |
 | 数据持久化 | 备份 `credentials.json`、`data/usage_stats`、`data/responses` |
 | 调试 | 生产默认不要开 `debugLogDir`；排查时可临时设为 `data/debug_logs` |
@@ -289,32 +286,21 @@ server {
 
 ### config.json
 
+仅暴露部署相关项；协议指纹（region / kiroVersion / systemVersion / nodeVersion / TLS）由程序内常量维护。
+
 | 字段 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
 | `host` | string | `127.0.0.1` | 服务监听地址；公网/Docker 用 `0.0.0.0` |
 | `port` | number | `8080` | 服务监听端口（示例常用 `8990`） |
 | `apiKey` | string | - | 客户端认证 Key（必配） |
 | `apiKeys` | array | `[]` | 多 Key：`{ "key", "name" }`，日志按 caller 区分 |
-| `region` | string | `us-east-1` | AWS 区域 |
-| `authRegion` | string | - | Token 刷新区域，未配置回退 region |
-| `apiRegion` | string | - | API 请求区域，未配置回退 region |
-| `kiroVersion` | string | `1.0.138` | Kiro IDE 版本号（UA / 协议对齐） |
-| `machineId` | string | - | 自定义机器码（64 位 hex），不填自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识（如 `darwin#24.6.0` / `win32#10.0.22631`） |
-| `nodeVersion` | string | `22.22.0` | Node.js 版本标识 |
-| `tlsBackend` | string | `rustls` | `rustls` 或 `native-tls` |
-| `countTokensApiUrl` | string | - | 外部 count_tokens API |
-| `countTokensApiKey` | string | - | 外部 count_tokens 密钥 |
-| `countTokensAuthType` | string | `x-api-key` | `x-api-key` 或 `bearer` |
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理 |
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | 配置后启用 Admin API + Web UI |
 | `loadBalancingMode` | string | `priority` | `priority` 或 `balanced` |
-| `extractThinking` | boolean | `true` | 非流式响应解析 `<thinking>` 块 |
 | `debugLogDir` | string | - | 调试日志目录；不设则关闭 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点 |
-| `endpoints` | object | `{}` | 端点特定配置 |
+| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点：`ide` 或 `cli` |
 | `includeOpenSourceModels` | boolean | `false` | `/v1/models` 是否包含开源模型 |
 
 完整配置示例：
@@ -328,18 +314,9 @@ server {
     {"key": "sk-user-alice-abc123", "name": "alice"},
     {"key": "sk-user-bob-def456", "name": "bob"}
   ],
-  "region": "us-east-1",
-  "tlsBackend": "rustls",
-  "kiroVersion": "1.0.138",
-  "machineId": "64位十六进制机器码",
-  "systemVersion": "linux#6.8.0",
-  "nodeVersion": "22.22.0",
-  "authRegion": "us-east-1",
-  "apiRegion": "us-east-1",
   "proxyUrl": "http://127.0.0.1:7890",
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "priority",
-  "extractThinking": true,
   "debugLogDir": "data/debug_logs",
   "defaultEndpoint": "ide",
   "includeOpenSourceModels": false
@@ -418,8 +395,14 @@ server {
 
 ### Region 配置
 
-**Auth Region**：`凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`  
-**API Region**：`凭据.apiRegion` > `config.apiRegion` > `config.region`
+全局 region **不再**出现在 `config.json`，程序默认 `us-east-1`。
+
+若账号需要跨区，请在 **credentials.json** 凭据级配置：
+
+| 字段 | 用途 |
+|------|------|
+| `authRegion` / `region` | Token 刷新区域 |
+| `apiRegion` | API 请求区域（未设时回退 `region`，再回退 `us-east-1`） |
 
 ### 代理配置
 
@@ -631,7 +614,7 @@ git push -u origin master
 2. **Token 刷新**：服务会自动刷新过期 Token
 3. **相对路径数据**：`data/usage_stats`、`data/responses`、`debugLogDir` 相对进程工作目录
 4. **Haiku**：不能设置思考强度；若客户端仍带 `output_config.effort`，本服务会自动忽略
-5. **GPT / Opus 4.8**：依赖较新的 Kiro Runtime 协议字段（`agentMode`、effort 等），请保持 `kiroVersion` 较新
+5. **GPT / Opus 4.8**：依赖较新的 Kiro Runtime 协议字段（`agentMode`、effort 等）；协议指纹已内置，升级二进制即可
 6. **WebSearch 工具**：Anthropic 路径下仅单个 `web_search` 工具时走内置转换逻辑；Responses 路径会丢弃 server-side web_search 定义以免上游校验失败
 
 ## 项目结构

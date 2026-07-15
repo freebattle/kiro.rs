@@ -1,21 +1,19 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum TlsBackend {
-    Rustls,
-    NativeTls,
-}
+/// 默认 AWS / Kiro 区域（程序内常量，不暴露给用户配置）
+pub const DEFAULT_REGION: &str = "us-east-1";
 
-impl Default for TlsBackend {
-    fn default() -> Self {
-        Self::Rustls
-    }
-}
+/// 协议指纹：Kiro IDE 版本（User-Agent / 协议对齐）
+pub const KIRO_VERSION: &str = "1.0.138";
+
+/// 协议指纹：IDE User-Agent 中的系统标识
+pub const SYSTEM_VERSION: &str = "darwin#24.6.0";
+
+/// 协议指纹：IDE User-Agent 中的 Node 版本
+pub const NODE_VERSION: &str = "22.22.0";
 
 /// 多 API Key 配置项
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +22,7 @@ pub struct ApiKeyEntry {
     pub name: String,
 }
 
-/// KNA 应用配置
+/// KNA 应用配置（仅用户真正需要关心的项）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -34,25 +32,6 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    #[serde(default = "default_region")]
-    pub region: String,
-
-    /// Auth Region（用于 Token 刷新），未配置时回退到 region
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_region: Option<String>,
-
-    /// API Region（用于 API 请求），未配置时回退到 region
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_region: Option<String>,
-
-    #[serde(default = "default_kiro_version")]
-    pub kiro_version: String,
-
-    #[serde(default)]
-    pub machine_id: Option<String>,
-
     #[serde(default)]
     pub api_key: Option<String>,
 
@@ -61,54 +40,30 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub api_keys: Vec<ApiKeyEntry>,
 
-    #[serde(default = "default_system_version")]
-    pub system_version: String,
-
-    #[serde(default = "default_node_version")]
-    pub node_version: String,
-
-    #[serde(default = "default_tls_backend")]
-    pub tls_backend: TlsBackend,
-
-    /// 外部 count_tokens API 地址（可选）
-    #[serde(default)]
-    pub count_tokens_api_url: Option<String>,
-
-    /// count_tokens API 密钥（可选）
-    #[serde(default)]
-    pub count_tokens_api_key: Option<String>,
-
-    /// count_tokens API 认证类型（可选，"x-api-key" 或 "bearer"，默认 "x-api-key"）
-    #[serde(default = "default_count_tokens_auth_type")]
-    pub count_tokens_auth_type: String,
-
     /// HTTP 代理地址（可选）
     /// 支持格式: http://host:port, https://host:port, socks5://host:port
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 
     /// 代理认证用户名（可选）
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_username: Option<String>,
 
     /// 代理认证密码（可选）
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_api_key: Option<String>,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
-
-    /// 是否开启非流式响应的 thinking 块提取（默认 true）
-    ///
-    /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
-    /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
-    #[serde(default = "default_extract_thinking")]
-    pub extract_thinking: bool,
 
     /// 调试日志目录（设置后开启请求报文记录，不设置则关闭）
     #[serde(default)]
@@ -119,14 +74,7 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
-    /// 端点特定的配置
-    ///
-    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
-    /// 未在此表出现的端点沿用实现内置默认值。
-    #[serde(default)]
-    pub endpoints: HashMap<String, serde_json::Value>,
-
-    /// 模型列表是否包含开源模型（默认 false，仅返回 Claude 模型）
+    /// 模型列表是否包含开源模型（默认 false，仅返回 Claude / GPT 等默认暴露模型）
     #[serde(default)]
     pub include_open_source_models: bool,
 
@@ -143,37 +91,8 @@ fn default_port() -> u16 {
     8080
 }
 
-fn default_region() -> String {
-    "us-east-1".to_string()
-}
-
-fn default_kiro_version() -> String {
-    "1.0.138".to_string()
-}
-
-fn default_system_version() -> String {
-    const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
-    SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
-}
-
-fn default_node_version() -> String {
-    "22.22.0".to_string()
-}
-
-fn default_count_tokens_auth_type() -> String {
-    "x-api-key".to_string()
-}
-
-fn default_tls_backend() -> TlsBackend {
-    TlsBackend::Rustls
-}
-
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
-}
-
-fn default_extract_thinking() -> bool {
-    true
 }
 
 fn default_endpoint() -> String {
@@ -185,28 +104,15 @@ impl Default for Config {
         Self {
             host: default_host(),
             port: default_port(),
-            region: default_region(),
-            auth_region: None,
-            api_region: None,
-            kiro_version: default_kiro_version(),
-            machine_id: None,
             api_key: None,
             api_keys: Vec::new(),
-            system_version: default_system_version(),
-            node_version: default_node_version(),
-            tls_backend: default_tls_backend(),
-            count_tokens_api_url: None,
-            count_tokens_api_key: None,
-            count_tokens_auth_type: default_count_tokens_auth_type(),
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
-            extract_thinking: default_extract_thinking(),
             debug_log_dir: None,
             default_endpoint: default_endpoint(),
-            endpoints: HashMap::new(),
             include_open_source_models: false,
             config_path: None,
         }
@@ -219,23 +125,12 @@ impl Config {
         "config.json"
     }
 
-    /// 获取有效的 Auth Region（用于 Token 刷新）
-    /// 优先使用 auth_region，未配置时回退到 region
-    pub fn effective_auth_region(&self) -> &str {
-        self.auth_region.as_deref().unwrap_or(&self.region)
-    }
-
-    /// 获取有效的 API Region（用于 API 请求）
-    /// 优先使用 api_region，未配置时回退到 region
-    pub fn effective_api_region(&self) -> &str {
-        self.api_region.as_deref().unwrap_or(&self.region)
-    }
-
     /// 从文件加载配置
+    ///
+    /// 未知字段会被忽略（便于清理历史配置后平滑过渡）。
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            // 配置文件不存在，返回默认配置
             let mut config = Self::default();
             config.config_path = Some(path.to_path_buf());
             return Ok(config);

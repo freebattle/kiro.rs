@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use debug_log::{DebugLogger, OptionalDebugLogger};
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -104,11 +104,13 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
-    // 构建端点注册表
+    // 构建端点注册表（ide = Kiro IDE Runtime；cli = Amazon Q / Kiro CLI）
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 
     // 校验默认端点存在
@@ -153,14 +155,6 @@ async fn main() {
         config.default_endpoint.clone(),
     );
 
-    // 初始化 count_tokens 配置
-    token::init_config(token::CountTokensConfig {
-        api_url: config.count_tokens_api_url.clone(),
-        api_key: config.count_tokens_api_key.clone(),
-        auth_type: config.count_tokens_auth_type.clone(),
-        proxy: proxy_config,
-        tls_backend: config.tls_backend,
-    });
 
     // 创建请求记录存储
     let request_log = RequestLogStore::new();
@@ -210,7 +204,6 @@ async fn main() {
         &api_key,
         config.api_keys.clone(),
         Some(kiro_provider),
-        config.extract_thinking,
         request_log.clone(),
         debug_logger,
         config.include_open_source_models,

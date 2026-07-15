@@ -26,12 +26,11 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     api_keys: Vec<ApiKeyEntry>,
     kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
     request_log: RequestLogStore,
     debug_logger: OptionalDebugLogger,
     include_open_source_models: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking, request_log)
+    let mut state = AppState::new(api_key, request_log)
         .with_api_keys(api_keys)
         .with_debug_logger(debug_logger)
         .with_include_open_source_models(include_open_source_models);
