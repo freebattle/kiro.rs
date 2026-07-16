@@ -312,6 +312,29 @@ pub struct ResponsesUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
+    /// OpenAI Responses：输入中命中缓存的 token 数（模拟 prompt cache）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<ResponsesInputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResponsesInputTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: i32,
+}
+
+impl ResponsesUsage {
+    pub fn with_cache(input_tokens: i32, output_tokens: i32, cached_tokens: i32) -> Self {
+        let input_tokens = input_tokens.max(0);
+        let output_tokens = output_tokens.max(0);
+        let cached_tokens = cached_tokens.max(0).min(input_tokens);
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            input_tokens_details: Some(ResponsesInputTokensDetails { cached_tokens }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,5 +370,26 @@ impl OpenAIErrorResponse {
                 code: None,
             },
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_responses_usage_with_cache_serializes_cached_tokens() {
+        let u = ResponsesUsage::with_cache(1000, 20, 800);
+        let v = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["input_tokens"], 1000);
+        assert_eq!(v["output_tokens"], 20);
+        assert_eq!(v["total_tokens"], 1020);
+        assert_eq!(v["input_tokens_details"]["cached_tokens"], 800);
+
+        // clamp cached to input
+        let u2 = ResponsesUsage::with_cache(100, 1, 999);
+        let v2 = serde_json::to_value(&u2).unwrap();
+        assert_eq!(v2["input_tokens_details"]["cached_tokens"], 100);
     }
 }

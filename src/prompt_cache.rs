@@ -30,23 +30,25 @@ impl PromptCacheTracker {
     /// 读取本轮可模拟的 cache_read，并刷新 TTL。
     ///
     /// **不会**把当前估算 input 写入基线。
-    /// 基线只在 [`finalize`] 用本轮最终 input 更新，避免：
-    /// 1. 估算值偏高 → 下一轮 cache 被 clamp 成全量 → 新增 input 显示 0
-    /// 2. `/v1/responses` 等路径忘记回写 actual 时污染后续统计
+    /// 基线只在 [`update_actual_tokens`] 用本轮最终 input 更新。
+    ///
+    /// 注意：返回值是「上一轮最终 input」作为候选缓存命中量，**不要**用请求前的
+    /// 本地估算值去 clamp。本地估算常远小于 Kiro `contextUsage` 反算的最终 input，
+    /// 过早 clamp 会把 cache 卡在 ~1k，日志里「输入」= final - cache 被撑到数万。
+    /// 最终上报时应再用 `cache.min(final_input)` 收口。
     pub fn compute_and_update(&self, session_fingerprint: u64, input_tokens: i32) -> i32 {
         let now = Instant::now();
         let mut entries = self.entries.lock();
 
         let cache_read_tokens = if let Some(entry) = entries.get_mut(&session_fingerprint) {
             if now.duration_since(entry.last_seen) < CACHE_TTL {
-                // 命中量不超过本轮 input；本轮 input 用估算值做上界保护
-                let hit = entry.last_input_tokens.min(input_tokens.max(0)).max(0);
+                let hit = entry.last_input_tokens.max(0);
                 entry.last_seen = now;
                 tracing::debug!(
                     fingerprint = session_fingerprint,
                     last_input = entry.last_input_tokens,
-                    current_input = input_tokens,
-                    cache_read = hit,
+                    current_input_estimate = input_tokens,
+                    cache_read_candidate = hit,
                     "prompt cache HIT"
                 );
                 hit
@@ -183,7 +185,7 @@ mod tests {
         // 最终实际 input 小于估算
         tracker.update_actual_tokens(fp, 16_931);
 
-        // 次轮：cache 应为上一轮最终值，而不是被高估的 20000
+        // 次轮：cache 候选 = 上一轮最终值（即使本轮估算不同也不改）
         let cache = tracker.compute_and_update(fp, 20_500);
         assert_eq!(cache, 16_931);
         tracker.update_actual_tokens(fp, 17_028);
@@ -191,17 +193,30 @@ mod tests {
         // 三轮
         let cache = tracker.compute_and_update(fp, 21_000);
         assert_eq!(cache, 17_028);
-        // 新增 = 21000 - 17028 > 0
         assert!(21_000 - cache > 0);
     }
 
     #[test]
-    fn cache_hit_clamped_to_current_input() {
+    fn cache_candidate_not_clamped_by_low_estimate() {
         let tracker = PromptCacheTracker::new();
         let fp = 7u64;
+        // 上一轮 contextUsage 最终 15k
+        tracker.update_actual_tokens(fp, 15_000);
+        // 本轮本地估算只有 1.1k（常见低估），候选 cache 仍应是 15k
+        // 上报时再 min(15k, final_input)
+        assert_eq!(tracker.compute_and_update(fp, 1_100), 15_000);
+    }
+
+    #[test]
+    fn finalize_clamp_handles_input_shrink() {
+        // 模拟 handlers 侧：safe_cache = candidate.min(final)
+        let tracker = PromptCacheTracker::new();
+        let fp = 8u64;
         tracker.update_actual_tokens(fp, 10_000);
-        // 本轮 input 回落（异常/压缩场景）时不能超过当前 input
-        assert_eq!(tracker.compute_and_update(fp, 8_000), 8_000);
+        let candidate = tracker.compute_and_update(fp, 1_000);
+        assert_eq!(candidate, 10_000);
+        let final_input = 8_000;
+        assert_eq!(candidate.min(final_input), 8_000);
     }
 
     #[test]

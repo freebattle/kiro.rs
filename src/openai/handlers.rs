@@ -288,13 +288,15 @@ async fn handle_non_stream(
     let collected = collect_kiro_events(&body_bytes, &tool_name_map, model, input_tokens);
     let output_tokens = estimate_output_tokens(&collected.text, &collected.tool_uses);
 
+    let in_tok_for_resp = collected.input_tokens.unwrap_or(input_tokens);
     let resp_obj = build_responses_object(
         &resp_id,
         model,
         &collected.text,
         &collected.tool_uses,
-        collected.input_tokens.unwrap_or(input_tokens),
+        in_tok_for_resp,
         output_tokens,
+        clamp_cache_read(cache_read_tokens, in_tok_for_resp),
         payload,
         &custom_tool_names,
     );
@@ -469,6 +471,7 @@ fn build_responses_object(
     tool_uses: &[CollectedToolUse],
     input_tokens: i32,
     output_tokens: i32,
+    cache_read_tokens: i32,
     req: &ResponsesRequest,
     custom_tool_names: &std::collections::HashSet<String>,
 ) -> ResponsesObject {
@@ -544,11 +547,7 @@ fn build_responses_object(
         status: "completed".to_string(),
         model: model.to_string(),
         output,
-        usage: ResponsesUsage {
-            input_tokens,
-            output_tokens,
-            total_tokens: input_tokens + output_tokens,
-        },
+        usage: ResponsesUsage::with_cache(input_tokens, output_tokens, cache_read_tokens),
         previous_response_id: req.previous_response_id.clone(),
         metadata: req.metadata.clone(),
         error: None,
@@ -1111,6 +1110,7 @@ impl StreamState {
 
         let in_tok = self.context_input_tokens.unwrap_or(self.input_tokens);
         let out_tok = estimate_output_tokens(&self.full_text, &self.tool_uses);
+        let safe_cache = clamp_cache_read(self.cache_read_tokens, in_tok);
         let mut resp_obj = build_responses_object(
             &self.resp_id,
             &self.model,
@@ -1118,6 +1118,7 @@ impl StreamState {
             &self.tool_uses,
             in_tok,
             out_tok,
+            safe_cache,
             &self.payload,
             &self.custom_tool_names,
         );

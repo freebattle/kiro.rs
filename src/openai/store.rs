@@ -257,6 +257,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 2,
                 total_tokens: 12,
+                input_tokens_details: None,
             },
             previous_response_id: None,
             metadata: None,
