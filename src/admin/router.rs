@@ -14,6 +14,7 @@ use super::{
     },
     middleware::{AdminState, admin_auth_middleware},
 };
+use crate::login::login_routes;
 
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
@@ -34,6 +35,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/requests", get(get_request_logs))
         .route("/requests/stats", get(get_request_stats))
         .route("/usage-stats", get(get_usage_stats))
+        .merge(login_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

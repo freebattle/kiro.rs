@@ -18,11 +18,12 @@
 
 mod error;
 mod handlers;
-mod middleware;
+pub mod middleware;
 mod router;
 mod service;
 pub mod types;
 
+pub use error::AdminServiceError;
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;

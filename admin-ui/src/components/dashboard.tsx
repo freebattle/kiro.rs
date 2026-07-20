@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine } from 'lucide-react'
 
-const APP_VERSION = '2026.7.19'
+const APP_VERSION = '2026.7.20'
 const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -9,12 +9,22 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { SocialLoginDialog } from '@/components/social-login-dialog'
+import { IdcLoginDialog } from '@/components/idc-login-dialog'
+import { ReloginDialog } from '@/components/relogin-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { getRequestLogs, type RequestRecord } from '@/api/requests'
@@ -30,6 +40,10 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [socialLoginOpen, setSocialLoginOpen] = useState(false)
+  const [idcLoginOpen, setIdcLoginOpen] = useState(false)
+  const [idcLoginMode, setIdcLoginMode] = useState<'builder-id' | 'enterprise'>('builder-id')
+  const [reloginTarget, setReloginTarget] = useState<{ id: number; authMethod: string | null } | null>(null)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -798,18 +812,52 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm">
-                <Plus className="h-4 w-4 mr-2" />
-                添加凭据
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm">
+                    <Plus className="h-4 w-4 mr-2" />
+                    添加凭据
+                    <ChevronDown className="h-4 w-4 ml-1 opacity-70" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuItem onSelect={() => setSocialLoginOpen(true)}>
+                    <KeyRound />
+                    Social 登录
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      setIdcLoginMode('builder-id')
+                      setIdcLoginOpen(true)
+                    }}
+                  >
+                    <Building2 />
+                    Builder ID
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      setIdcLoginMode('enterprise')
+                      setIdcLoginOpen(true)
+                    }}
+                  >
+                    <Building2 />
+                    企业 IdC
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => setAddDialogOpen(true)}>
+                    <PenLine />
+                    手动添加
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setBatchImportDialogOpen(true)}>
+                    <Upload />
+                    批量导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setKamImportDialogOpen(true)}>
+                    <FileUp />
+                    Kiro Account Manager 导入
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
           {data?.credentials.length === 0 ? (
@@ -826,6 +874,7 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
+                    onRelogin={(id, authMethod) => setReloginTarget({ id, authMethod })}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -874,6 +923,29 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      <SocialLoginDialog
+        open={socialLoginOpen}
+        onOpenChange={setSocialLoginOpen}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
+      />
+
+      <IdcLoginDialog
+        open={idcLoginOpen}
+        onOpenChange={setIdcLoginOpen}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
+        mode={idcLoginMode}
+      />
+
+      <ReloginDialog
+        open={reloginTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setReloginTarget(null)
+        }}
+        credentialId={reloginTarget?.id ?? 0}
+        authMethod={reloginTarget?.authMethod ?? null}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
       />
 
       {/* 批量导入对话框 */}

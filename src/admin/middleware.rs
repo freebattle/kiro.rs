@@ -13,6 +13,7 @@ use axum::{
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use crate::common::auth;
+use crate::login::LoginService;
 use crate::request_log::RequestLogStore;
 use crate::usage_stats::UsageStatsStore;
 
@@ -23,6 +24,8 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 登录授权服务（Social / IdC / re-login）
+    pub login: Arc<LoginService>,
     /// 请求记录存储
     pub request_log: RequestLogStore,
     /// 用量统计存储
@@ -33,12 +36,14 @@ impl AdminState {
     pub fn new(
         admin_api_key: impl Into<String>,
         service: AdminService,
+        login: LoginService,
         request_log: RequestLogStore,
         usage_stats: UsageStatsStore,
     ) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            login: Arc::new(login),
             request_log,
             usage_stats,
         }

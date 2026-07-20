@@ -22,7 +22,8 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::AvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::user_agent;
@@ -121,6 +122,11 @@ pub(crate) async fn refresh_token(
 
     validate_refresh_token(credentials)?;
 
+    // 企业 SSO 优先分流：有 clientId 但无 clientSecret，不能误判为 social/idc
+    if credentials.is_external_idp_credential() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
+
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
@@ -136,6 +142,8 @@ pub(crate) async fn refresh_token(
         || auth_method.eq_ignore_ascii_case("iam")
     {
         refresh_idc_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("external_idp") {
+        refresh_external_idp_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
     }
@@ -321,6 +329,99 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新企业 SSO (external_idp) Token
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    _config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP (企业 SSO) Token...");
+
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 缺少 refreshToken"))?;
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+
+    crate::kiro::model::credentials::validate_external_idp_endpoint(token_endpoint)
+        .map_err(|e| anyhow::anyhow!("External IdP tokenEndpoint 被拒绝: {}", e))?;
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials
+        .scopes
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        form.push(("scope", scopes));
+    }
+
+    let client = build_client(proxy, 60)?;
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    let data: ExternalIdpRefreshResponse = serde_json::from_str(&body_text).unwrap_or_default();
+
+    let access_token = match data.access_token {
+        Some(token) if status.is_success() && !token.trim().is_empty() => token,
+        _ => {
+            let is_invalid_grant = data
+                .error
+                .as_deref()
+                .map(|e| e.eq_ignore_ascii_case("invalid_grant"))
+                .unwrap_or(false)
+                || (status.as_u16() == 400 && body_text.contains("invalid_grant"));
+            if is_invalid_grant {
+                return Err(RefreshTokenInvalidError {
+                    message: format!(
+                        "External IdP refreshToken 已失效 (invalid_grant): {}",
+                        data.error_description.as_deref().unwrap_or(&body_text)
+                    ),
+                }
+                .into());
+            }
+            bail!(
+                "External IdP Token 刷新失败 {}: {}",
+                status,
+                data.error_description.unwrap_or(body_text)
+            );
+        }
+    };
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(access_token);
+    if let Some(new_refresh_token) = data.refresh_token.filter(|s| !s.trim().is_empty()) {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -474,7 +575,9 @@ async fn list_available_profiles_once(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> Result<String, (bool, anyhow::Error)> {
-    let region = credentials.effective_api_region();
+    // profileArn 发现必须走 management 默认区域，不能用 SSO/auth region
+    // （如 ap-southeast-1 没有 management.*.kiro.dev 端点）。
+    let region = crate::model::config::DEFAULT_REGION;
     let host = format!("management.{}.kiro.dev", region);
     let url = format!("https://{}/ListAvailableProfiles", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
@@ -1798,6 +1901,130 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 更新已禁用凭据的 refreshToken（登录/重新登录使用）
+    ///
+    /// 前置条件：凭据必须已禁用。
+    pub fn update_refresh_token(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!(
+                    "只能为已禁用的凭据更新 refreshToken（请先禁用凭据 #{}）",
+                    id
+                );
+            }
+
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} refreshToken 已更新", id);
+        Ok(())
+    }
+
+    /// 更新 external_idp 重新登录拿到的 token 和刷新元数据。
+    pub fn update_external_idp_relogin(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+        client_id: String,
+        token_endpoint: String,
+        issuer_url: String,
+        scopes: String,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!(
+                    "只能为已禁用的凭据更新 external_idp Token（请先禁用凭据 #{}）",
+                    id
+                );
+            }
+
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                auth_method: Some("external_idp".to_string()),
+                provider: Some("AzureAD".to_string()),
+                client_id: Some(client_id.clone()),
+                client_secret: None,
+                token_endpoint: Some(token_endpoint.clone()),
+                issuer_url: Some(issuer_url.clone()),
+                scopes: Some(scopes.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.credentials.auth_method = Some("external_idp".to_string());
+            entry.credentials.provider = Some("AzureAD".to_string());
+            entry.credentials.client_id = Some(client_id);
+            entry.credentials.client_secret = None;
+            entry.credentials.token_endpoint = Some(token_endpoint);
+            entry.credentials.issuer_url = Some(issuer_url);
+            entry.credentials.scopes = Some(scopes);
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} external_idp Token 已更新", id);
+        Ok(())
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -2049,6 +2276,37 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.provider = new_cred.provider;
+        validated_cred.start_url = new_cred.start_url;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
+        validated_cred.endpoint = new_cred.endpoint;
+        // 登录/导入时若已带 profileArn（如 Social 响应），先保留
+        if validated_cred.profile_arn.is_none() {
+            validated_cred.profile_arn = new_cred.profile_arn;
+        }
+
+        // 6. 登录完成后立即解析 profileArn 并写入凭据
+        // 后续 API 请求通过 effective_api_region() 从 profileArn 取真实区域
+        let effective_proxy = validated_cred.effective_proxy(self.proxy.as_ref());
+        let access_token = if validated_cred.is_api_key_credential() {
+            validated_cred.kiro_api_key.clone()
+        } else {
+            validated_cred.access_token.clone()
+        }
+        .ok_or_else(|| anyhow::anyhow!("缺少 accessToken，无法解析 profileArn"))?;
+
+        let (resolved_cred, profile_resolved) = resolve_profile_arn(
+            &validated_cred,
+            &self.config,
+            &access_token,
+            effective_proxy.as_ref(),
+            false,
+        )
+        .await?;
+        validated_cred = resolved_cred;
+        validated_cred.id = Some(new_id);
 
         {
             let mut entries = self.entries.lock();
@@ -2064,10 +2322,14 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
+        // 7. 持久化（含 profileArn）
         self.persist_credentials()?;
 
-        tracing::info!("成功添加凭据 #{}", new_id);
+        if profile_resolved {
+            tracing::info!("成功添加凭据 #{}，已解析并缓存 profileArn", new_id);
+        } else {
+            tracing::info!("成功添加凭据 #{}", new_id);
+        }
         Ok(new_id)
     }
 
@@ -2377,6 +2639,10 @@ mod tests {
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
+        // 已有 profileArn 时跳过网络解析，避免单测依赖外网
+        api_key_cred.profile_arn = Some(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST".to_string(),
+        );
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
@@ -2463,6 +2729,9 @@ mod tests {
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.profile_arn = Some(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST".to_string(),
+        );
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());

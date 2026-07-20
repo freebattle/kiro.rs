@@ -8,7 +8,6 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::Config;
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -34,17 +33,37 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / external_idp / api_key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
-    /// OIDC Client ID (IdC 认证需要)
+    /// 身份提供商（如 BuilderId / Enterprise / AzureAD）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// OIDC Client ID (IdC / external_idp 需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+
+    /// IdC Start URL（Builder ID 默认或企业 IAM Identity Center）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+
+    /// 企业 SSO (external_idp) OAuth2 token 端点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 企业 SSO issuer URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 企业 SSO scopes（空格分隔）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -121,8 +140,49 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external_idp")
+        || value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("azuread")
+        || value.eq_ignore_ascii_case("azure_ad")
+    {
+        "external_idp"
     } else {
         value
+    }
+}
+
+/// 允许的企业 SSO IdP host 后缀（防 SSRF）
+pub const ALLOWED_EXTERNAL_IDP_SUFFIXES: &[&str] = &[
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 校验企业 SSO IdP 端点 URL 是否可安全外发。
+pub fn validate_external_idp_endpoint(raw_url: &str) -> Result<(), String> {
+    let url =
+        reqwest::Url::parse(raw_url.trim()).map_err(|e| format!("IdP 端点 URL 无法解析: {}", e))?;
+
+    if !url.scheme().eq_ignore_ascii_case("https") {
+        return Err("IdP 端点 URL 必须为 https".to_string());
+    }
+
+    let host = match url.host_str() {
+        Some(h) if !h.is_empty() => h.to_ascii_lowercase(),
+        _ => return Err("IdP 端点 URL 缺少 host".to_string()),
+    };
+
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err("IdP 端点 host 不能是 IP 字面量".to_string());
+    }
+
+    if ALLOWED_EXTERNAL_IDP_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        Ok(())
+    } else {
+        Err(format!("IdP 端点 host {:?} 不在允许列表内", host))
     }
 }
 
@@ -207,12 +267,38 @@ impl KiroCredentials {
             .unwrap_or(crate::model::config::DEFAULT_REGION)
     }
 
+    /// 从 profileArn 解析真实 API Region。
+    ///
+    /// ARN 形如 `arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX`。
+    pub fn region_from_profile_arn(profile_arn: &str) -> Option<&str> {
+        // arn:partition:service:region:account:resource...
+        let parts: Vec<&str> = profile_arn.trim().split(':').collect();
+        if parts.len() < 6 {
+            return None;
+        }
+        let region = parts[3];
+        // 空 region 或误把 resource 当成 region 的短 ARN 直接丢弃
+        if region.is_empty() || region.contains('/') {
+            return None;
+        }
+        Some(region)
+    }
+
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > 凭据.region > 程序默认 us-east-1
+    /// 优先级：凭据.api_region > profileArn 内 region > 凭据.region > 程序默认 us-east-1
     pub fn effective_api_region(&self) -> &str {
-        self.api_region
+        if let Some(region) = self.api_region.as_deref() {
+            return region;
+        }
+        if let Some(region) = self
+            .profile_arn
             .as_deref()
-            .or(self.region.as_deref())
+            .and_then(Self::region_from_profile_arn)
+        {
+            return region;
+        }
+        self.region
+            .as_deref()
             .unwrap_or(crate::model::config::DEFAULT_REGION)
     }
 
@@ -273,6 +359,15 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 检查是否为企业 SSO (external_idp) 凭据
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("external_idp"))
+            .unwrap_or(false)
+            || self.token_endpoint.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +426,11 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            provider: None,
+            start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -449,6 +549,11 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            provider: None,
+            start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -480,6 +585,11 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            provider: None,
+            start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -594,6 +704,11 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            provider: None,
+            start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
@@ -728,7 +843,21 @@ mod tests {
         let mut creds = KiroCredentials::default();
         creds.api_region = Some("cred-api-region".to_string());
         creds.region = Some("cred-region".to_string());
+        creds.profile_arn = Some(
+            "arn:aws:codewhisperer:us-west-2:123456789012:profile/TEST".to_string(),
+        );
         assert_eq!(creds.effective_api_region(), "cred-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_from_profile_arn() {
+        let mut creds = KiroCredentials::default();
+        creds.region = Some("ap-southeast-1".to_string());
+        creds.profile_arn = Some(
+            "arn:aws:codewhisperer:us-east-1:319585546877:profile/HDYWH4GRKMUY".to_string(),
+        );
+        // profileArn 优先于凭据.region（SSO region 不能污染 API region）
+        assert_eq!(creds.effective_api_region(), "us-east-1");
     }
 
     #[test]
@@ -742,6 +871,35 @@ mod tests {
     fn test_effective_api_region_fallback_to_default() {
         let creds = KiroCredentials::default();
         assert_eq!(creds.effective_api_region(), crate::model::config::DEFAULT_REGION);
+    }
+
+    #[test]
+    fn test_region_from_profile_arn_valid() {
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn(
+                "arn:aws:codewhisperer:us-east-1:319585546877:profile/HDYWH4GRKMUY"
+            ),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn(
+                " arn:aws:codewhisperer:eu-central-1:1:profile/X "
+            ),
+            Some("eu-central-1")
+        );
+    }
+
+    #[test]
+    fn test_region_from_profile_arn_invalid() {
+        assert_eq!(KiroCredentials::region_from_profile_arn(""), None);
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn("arn:aws:codewhisperer:profile/test"),
+            None
+        );
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn("arn:aws:codewhisperer::123:profile/X"),
+            None
+        );
     }
 
     #[test]

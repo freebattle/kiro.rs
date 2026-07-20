@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, KeyRound } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,6 +27,7 @@ import {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  onRelogin?: (id: number, authMethod: string | null) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -52,6 +53,7 @@ function formatLastUsed(lastUsedAt: string | null): string {
 export function CredentialCard({
   credential,
   onViewBalance,
+  onRelogin,
   selected,
   onToggleSelect,
   balance,
@@ -167,6 +169,7 @@ export function CredentialCard({
                     {credential.authMethod === 'api_key' ? 'API Key' :
                      credential.authMethod === 'idc' ? 'IdC' :
                      credential.authMethod === 'social' ? 'Social' :
+                     credential.authMethod === 'external_idp' ? '企业 SSO' :
                      credential.authMethod}
                   </Badge>
                 )}
@@ -315,6 +318,17 @@ export function CredentialCard({
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
             </Button>
+            {onRelogin && credential.authMethod !== 'api_key' && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onRelogin(credential.id, credential.authMethod)}
+                title="通过浏览器重新授权并更新 Token"
+              >
+                <KeyRound className="h-4 w-4 mr-1" />
+                重新登录
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"

@@ -6,6 +6,7 @@ mod common;
 mod debug_log;
 mod http_client;
 mod kiro;
+mod login;
 mod model;
 pub mod prompt_cache;
 pub mod request_log;
@@ -224,9 +225,12 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let login_service =
+                login::LoginService::new(token_manager.clone(), proxy_config.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
+                login_service,
                 request_log.clone(),
                 usage_stats.clone(),
             );

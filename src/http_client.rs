@@ -41,9 +41,29 @@ impl ProxyConfig {
 /// * `proxy` - 可选的代理配置
 /// * `timeout_secs` - 超时时间（秒）
 pub fn build_client(proxy: Option<&ProxyConfig>, timeout_secs: u64) -> anyhow::Result<Client> {
+    build_client_with_redirect(proxy, timeout_secs, true)
+}
+
+/// 构建禁用自动重定向的 HTTP Client（OIDC discovery 等场景需要）
+pub fn build_client_no_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+) -> anyhow::Result<Client> {
+    build_client_with_redirect(proxy, timeout_secs, false)
+}
+
+fn build_client_with_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    follow_redirect: bool,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .use_rustls_tls();
+
+    if !follow_redirect {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;

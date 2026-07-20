@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "2026.7.19"
+version = "2026.7.20"
 edition = "2024"
 
 [features]
@@ -27,6 +27,7 @@ uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 crc = "3"           # CRC32C 计算
 bytes = "1"         # 高效的字节缓冲区
 tower-http = { version = "0.6", features = ["cors"] }
