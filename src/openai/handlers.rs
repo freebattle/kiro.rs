@@ -258,6 +258,7 @@ async fn handle_non_stream(
     store_response: bool,
     store: &ResponseStore,
 ) -> Response {
+    let thinking_effort = resolve_thinking_effort(payload);
     let (response, credential_id) = match provider.call_api(request_body).await {
         Ok(r) => r,
         Err(e) => {
@@ -268,6 +269,7 @@ async fn handle_non_stream(
                 cache_read_tokens,
                 start_time,
                 caller_name,
+                thinking_effort.clone(),
                 false,
             );
             return map_provider_error(e);
@@ -333,7 +335,7 @@ async fn handle_non_stream(
                 success: true,
                 credits,
                 caller: caller_name,
-                thinking_effort: None,
+                thinking_effort,
             });
         });
     }
@@ -586,12 +588,14 @@ async fn handle_stream(
                 cache_read_tokens,
                 start_time,
                 caller_name,
+                resolve_thinking_effort(&payload),
                 true,
             );
             return map_provider_error(e);
         }
     };
 
+    let thinking_effort = resolve_thinking_effort(&payload);
     let created_at = now_unix();
     let initial = ResponsesObject {
         id: resp_id.clone(),
@@ -631,6 +635,7 @@ async fn handle_stream(
             session_fp,
             start_time,
             caller_name,
+            thinking_effort,
             credential_id,
             full_text: String::new(),
             tool_uses: Vec::new(),
@@ -750,6 +755,7 @@ struct StreamState {
     session_fp: u64,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
     credential_id: u64,
     full_text: String,
     tool_uses: Vec<CollectedToolUse>,
@@ -1143,6 +1149,7 @@ impl StreamState {
             let credits = self.credits;
             let credential_id = self.credential_id;
             let caller_name = self.caller_name.clone();
+            let thinking_effort = self.thinking_effort.clone();
             let ttft_ms = self
                 .first_token_at
                 .map(|t| t.duration_since(self.start_time).as_millis() as u64);
@@ -1163,7 +1170,7 @@ impl StreamState {
                     success: true,
                     credits,
                     caller: caller_name,
-                    thinking_effort: None,
+                    thinking_effort,
                 });
             });
         }
@@ -1201,6 +1208,18 @@ fn map_provider_error(e: anyhow::Error) -> Response {
     }
 }
 
+fn resolve_thinking_effort(payload: &ResponsesRequest) -> Option<String> {
+    payload
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref())
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            converter::is_gpt_upstream_model(&payload.model).then(|| "high".to_string())
+        })
+}
+
 fn log_failure(
     request_log: &RequestLogStore,
     model: &str,
@@ -1208,6 +1227,7 @@ fn log_failure(
     cache_read_tokens: i32,
     start_time: Instant,
     caller_name: Option<String>,
+    thinking_effort: Option<String>,
     stream: bool,
 ) {
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1227,7 +1247,7 @@ fn log_failure(
             success: false,
             credits: 0.0,
             caller: caller_name,
-            thinking_effort: None,
+            thinking_effort,
         });
     });
 }

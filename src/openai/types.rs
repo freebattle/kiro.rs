@@ -28,8 +28,17 @@ pub struct ResponsesRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub max_output_tokens: Option<i32>,
+    /// OpenAI Responses reasoning configuration.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl ResponsesRequest {
@@ -377,6 +386,18 @@ impl OpenAIErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_responses_request_deserializes_reasoning_effort() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "reasoning": {"effort": "low"}
+        }))
+        .unwrap();
+
+        assert_eq!(request.reasoning.unwrap().effort.as_deref(), Some("low"));
+    }
 
     #[test]
     fn test_responses_usage_with_cache_serializes_cached_tokens() {

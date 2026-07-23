@@ -129,7 +129,11 @@ pub fn responses_to_anthropic(
         tools: tools.clone(),
         tool_choice: sanitize_tool_choice(req.tool_choice.as_ref(), tools.as_ref()),
         thinking: None,
-        output_config: None,
+        output_config: req.reasoning.as_ref().and_then(|reasoning| {
+            reasoning.effort.as_ref().map(|effort| crate::anthropic::types::OutputConfig {
+                effort: effort.clone(),
+            })
+        }),
         metadata: None,
     })
 }
@@ -485,6 +489,29 @@ mod tests {
     use crate::openai::types::{OpenAIMessage, ResponsesRequest, ToolCall};
 
     #[test]
+    fn test_reasoning_effort_converts_to_output_config() {
+        let req = ResponsesRequest {
+            model: "gpt-5.6".to_string(),
+            input: json!("hi"),
+            instructions: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            previous_response_id: None,
+            store: None,
+            temperature: None,
+            max_output_tokens: None,
+            reasoning: Some(crate::openai::types::ReasoningConfig {
+                effort: Some("low".to_string()),
+            }),
+            metadata: None,
+        };
+        let out = responses_to_anthropic(&req, &[OpenAIMessage::user_text("hi")]).unwrap();
+
+        assert_eq!(out.output_config.unwrap().effort, "low");
+    }
+
+    #[test]
     fn test_responses_to_anthropic_basic() {
         let req = ResponsesRequest {
             model: "gpt-5.6".to_string(),
@@ -497,6 +524,7 @@ mod tests {
             store: None,
             temperature: None,
             max_output_tokens: Some(1024),
+            reasoning: None,
             metadata: None,
         };
         let messages = vec![
@@ -531,6 +559,7 @@ mod tests {
             store: None,
             temperature: None,
             max_output_tokens: None,
+            reasoning: None,
             metadata: None,
         };
         let messages = vec![
@@ -666,6 +695,7 @@ mod tests {
             store: None,
             temperature: None,
             max_output_tokens: Some(32),
+            reasoning: None,
             metadata: None,
         };
         let messages = vec![OpenAIMessage::user_text("hi")];
