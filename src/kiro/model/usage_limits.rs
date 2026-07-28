@@ -49,6 +49,8 @@ pub struct OverageConfiguration {
 }
 
 /// 用户信息
+///
+/// `email` 仅在请求带 `isEmailRequired=true` 时返回，否则为 `null`。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -57,6 +59,12 @@ pub struct UserInfo {
     pub identity_provider: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
+    /// 账户邮箱（需 isEmailRequired=true）
+    #[serde(default)]
+    pub email: Option<String>,
+    /// 账户内部用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 使用量明细
@@ -170,6 +178,15 @@ impl UsageLimitsResponse {
             .and_then(|info| info.subscription_title.as_deref())
     }
 
+    /// 获取账户邮箱（去除首尾空白，空字符串视为无）
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+    }
+
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
@@ -227,5 +244,51 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_user_info_email() {
+        // 真实响应形状（isEmailRequired=true）
+        let body = r#"{
+            "nextDateReset": 1.7855424E9,
+            "subscriptionInfo": {"subscriptionTitle": "KIRO PRO MAX"},
+            "usageBreakdownList": [],
+            "userInfo": {"email": "user@example.com", "userId": "d-96671a47ab.f92a75ec"}
+        }"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.email(), Some("user@example.com"));
+        assert_eq!(
+            parsed.user_info.as_ref().unwrap().user_id.as_deref(),
+            Some("d-96671a47ab.f92a75ec")
+        );
+        assert_eq!(parsed.subscription_title(), Some("KIRO PRO MAX"));
+    }
+
+    #[test]
+    fn test_email_none_when_null_or_blank() {
+        // 不带 isEmailRequired 时上游返回 email: null
+        let body = r#"{"userInfo":{"email":null,"userId":"u-1"},"usageBreakdownList":[]}"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.email(), None);
+
+        let blank = r#"{"userInfo":{"email":"   ","userId":"u-1"},"usageBreakdownList":[]}"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(blank).unwrap();
+        assert_eq!(parsed.email(), None);
+
+        let no_user_info = r#"{"usageBreakdownList":[]}"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(no_user_info).unwrap();
+        assert_eq!(parsed.email(), None);
+    }
+
+    #[test]
+    fn test_email_trimmed() {
+        let body = r#"{"userInfo":{"email":" user@example.com "},"usageBreakdownList":[]}"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.email(), Some("user@example.com"));
     }
 }

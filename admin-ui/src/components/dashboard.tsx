@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine } from 'lucide-react'
 
-const APP_VERSION = '2026.7.20'
+const APP_VERSION = '2026.7.28'
 const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -499,6 +499,9 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
 
     setQueryingInfo(false)
 
+    // 余额查询会回填邮箱/订阅等级，刷新列表以展示最新信息
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
     } else {
@@ -583,6 +586,9 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     }
 
     setVerifying(false)
+
+    // 验活走的也是余额接口，会回填邮箱/订阅等级
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
     if (!cancelVerifyRef.current) {
       toast.success(`验活完成：成功 ${successCount}/${ids.length}`)

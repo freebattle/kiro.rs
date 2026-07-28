@@ -88,7 +88,7 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
-    /// 用户邮箱（从 Anthropic API 获取）
+    /// 用户邮箱（由 getUsageLimits?isEmailRequired=true 回填，或登录时手填）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 

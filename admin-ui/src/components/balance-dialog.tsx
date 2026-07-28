@@ -1,3 +1,5 @@
+import { useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -16,6 +18,14 @@ interface BalanceDialogProps {
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const queryClient = useQueryClient()
+
+  // 余额接口会回填邮箱/订阅等级到凭据，拉到结果后刷新凭据列表
+  useEffect(() => {
+    if (balance) {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    }
+  }, [balance, queryClient])
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'

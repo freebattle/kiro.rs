@@ -437,8 +437,9 @@ pub(crate) async fn get_usage_limits(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
 
     // 构建 URL
+    // isEmailRequired=true：让响应的 userInfo.email 返回真实邮箱（不带该参数时固定为 null）
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     );
 
@@ -2123,11 +2124,12 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+        // 回填订阅等级与账户邮箱到凭据（仅在发生变化时持久化）
+        let mut changed = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if let Some(subscription_title) = usage_limits.subscription_title() {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
                         entry.credentials.subscription_title = Some(subscription_title.to_string());
@@ -2137,19 +2139,24 @@ impl MultiTokenManager {
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
-                } else {
-                    false
                 }
-            };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                if let Some(email) = usage_limits.email() {
+                    let old_email = entry.credentials.email.clone();
+                    if old_email.as_deref() != Some(email) {
+                        entry.credentials.email = Some(email.to_string());
+                        tracing::info!("凭据 #{} 邮箱已更新: {:?} -> {}", id, old_email, email);
+                        changed = true;
+                    }
                 }
+            }
+        }
+
+        if changed {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("凭据信息更新后持久化失败（不影响本次请求）: {}", e);
             }
         }
 
