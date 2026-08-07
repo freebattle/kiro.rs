@@ -250,30 +250,31 @@ export function CredentialCard({
           </div>
 
           {/* 操作按钮 */}
-          <div className="flex gap-2 pt-2 border-t">
+          <div className="flex items-center justify-end gap-1 pt-2 border-t">
             <Button
               size="sm"
-              variant="default"
-              className="h-7 flex-1"
+              variant="ghost"
+              className="h-6 px-2 text-xs"
               onClick={() => onQueryBalance(credential.id)}
               disabled={loadingBalance}
+              title="查询余额并更新卡片信息"
             >
               {loadingBalance ? (
-                <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
               ) : (
-                <Wallet className="h-3.5 w-3.5 mr-1" />
+                <Wallet className="h-3 w-3 mr-1" />
               )}
               查询余额
             </Button>
             <Button
               size="sm"
-              variant="destructive"
-              className="h-7"
+              variant="ghost"
+              className="h-6 px-2 text-xs text-destructive hover:text-destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
-              title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
+              title={!credential.disabled ? '需要先禁用凭据才能删除' : '删除凭据'}
             >
-              <Trash2 className="h-3.5 w-3.5 mr-1" />
+              <Trash2 className="h-3 w-3 mr-1" />
               删除
             </Button>
           </div>

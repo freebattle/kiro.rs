@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine, ArrowUpToLine } from 'lucide-react'
 
 const APP_VERSION = __APP_VERSION__
 const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
@@ -25,7 +25,7 @@ import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { IdcLoginDialog } from '@/components/idc-login-dialog'
 import { ReloginDialog } from '@/components/relogin-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, setCredentialPriority } from '@/api/credentials'
 import { getRequestLogs, type RequestRecord } from '@/api/requests'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -59,6 +59,7 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [prioritizing, setPrioritizing] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -93,6 +94,7 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const singleSelected = selectedIds.size === 1
     ? data?.credentials.find(c => c.id === Array.from(selectedIds)[0])
     : undefined
+  const isPriorityMode = (loadBalancingData?.mode ?? 'priority') === 'priority'
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -320,6 +322,49 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  // 将选中凭据置顶（优先级 0），其余凭据降到 1 以后
+  const handlePrioritizeSelected = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要置顶的凭据')
+      return
+    }
+
+    const all = data?.credentials ?? []
+    // 先降级其他凭据，再提升选中凭据，保证后端最后一次重选落在选中凭据上
+    const demotions = all
+      .filter(c => !selectedIds.has(c.id) && c.priority === 0)
+      .map(c => ({ id: c.id, priority: 1 }))
+    const promotions = all
+      .filter(c => selectedIds.has(c.id) && c.priority !== 0)
+      .map(c => ({ id: c.id, priority: 0 }))
+    const updates = [...demotions, ...promotions]
+
+    if (updates.length === 0) {
+      toast.info('选中凭据已是最高优先级')
+      return
+    }
+
+    setPrioritizing(true)
+
+    let failCount = 0
+    for (const update of updates) {
+      try {
+        await setCredentialPriority(update.id, update.priority)
+      } catch {
+        failCount++
+      }
+    }
+
+    setPrioritizing(false)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+    if (failCount === 0) {
+      toast.success(`已将 ${selectedIds.size} 个凭据置顶（优先级 0）`)
+    } else {
+      toast.warning(`置顶完成，其中 ${failCount} 个更新失败`)
+    }
   }
 
   // 批量恢复异常
@@ -779,6 +824,18 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
             <div className="flex gap-2">
               {selectedIds.size > 0 && (
                 <>
+                  {isPriorityMode && (
+                    <Button
+                      onClick={handlePrioritizeSelected}
+                      size="sm"
+                      variant="outline"
+                      disabled={prioritizing}
+                      title="将选中凭据优先级设为 0，其余凭据降级，立即生效"
+                    >
+                      <ArrowUpToLine className="h-4 w-4 mr-2" />
+                      {prioritizing ? '置顶中...' : '置顶优先'}
+                    </Button>
+                  )}
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
