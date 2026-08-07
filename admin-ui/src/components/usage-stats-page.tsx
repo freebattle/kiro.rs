@@ -9,8 +9,7 @@ interface UsageStatsPageProps {
   onBack: () => void
 }
 
-interface FlatRow {
-  credentialId: string
+interface ModelRow {
   model: string
   usage: ModelUsage
 }
@@ -42,7 +41,7 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
     fetchData()
   }, [fetchData])
 
-  const rows = flattenUsage(data)
+  const rows = aggregateByModel(data)
   const callerRows = flattenCallerUsage(data)
   const totals = computeTotals(rows)
 
@@ -144,14 +143,16 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
           </Card>
         )}
 
-        {/* 按凭据明细表格 */}
+        {/* 按模型明细表格 */}
         <Card>
+          <CardHeader>
+            <CardTitle className="text-base">按模型统计</CardTitle>
+          </CardHeader>
           <CardContent className="p-0">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b bg-muted/50">
-                    <th className="text-left p-3 font-medium">凭据</th>
                     <th className="text-left p-3 font-medium">模型</th>
                     <th className="text-right p-3 font-medium">请求数</th>
                     <th className="text-right p-3 font-medium">Credits</th>
@@ -163,9 +164,6 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
                 <tbody>
                   {rows.map((row, idx) => (
                     <tr key={idx} className="border-b hover:bg-muted/30">
-                      <td className="p-3">
-                        <Badge variant="outline">#{row.credentialId}</Badge>
-                      </td>
                       <td className="p-3 font-mono text-xs">{shortenModel(row.model)}</td>
                       <td className="p-3 text-right tabular-nums">{row.usage.requests.toLocaleString()}</td>
                       <td className="p-3 text-right tabular-nums text-amber-600">{formatCredits(row.usage.credits)}</td>
@@ -176,7 +174,7 @@ export function UsageStatsPage({ onBack }: UsageStatsPageProps) {
                   ))}
                   {rows.length === 0 && !loading && (
                     <tr>
-                      <td colSpan={7} className="p-8 text-center text-muted-foreground">
+                      <td colSpan={6} className="p-8 text-center text-muted-foreground">
                         本月暂无用量数据
                       </td>
                     </tr>
@@ -208,14 +206,30 @@ function nextMonth(m: string): string {
   return `${y}-${String(mo + 1).padStart(2, '0')}`
 }
 
-function flattenUsage(data: MonthlyUsage | null): FlatRow[] {
+function aggregateByModel(data: MonthlyUsage | null): ModelRow[] {
   if (!data) return []
-  const rows: FlatRow[] = []
-  for (const [credId, models] of Object.entries(data.credentials)) {
+  const merged = new Map<string, ModelUsage>()
+  for (const models of Object.values(data.credentials)) {
     for (const [model, usage] of Object.entries(models)) {
-      rows.push({ credentialId: credId, model, usage })
+      const acc = merged.get(model)
+      if (acc) {
+        acc.requests += usage.requests
+        acc.input_tokens += usage.input_tokens
+        acc.output_tokens += usage.output_tokens
+        acc.cache_read_tokens += usage.cache_read_tokens || 0
+        acc.credits += usage.credits || 0
+      } else {
+        merged.set(model, {
+          requests: usage.requests,
+          input_tokens: usage.input_tokens,
+          output_tokens: usage.output_tokens,
+          cache_read_tokens: usage.cache_read_tokens || 0,
+          credits: usage.credits || 0,
+        })
+      }
     }
   }
+  const rows: ModelRow[] = [...merged].map(([model, usage]) => ({ model, usage }))
   rows.sort((a, b) => b.usage.requests - a.usage.requests)
   return rows
 }
@@ -232,7 +246,7 @@ function flattenCallerUsage(data: MonthlyUsage | null): CallerRow[] {
   return rows
 }
 
-function computeTotals(rows: FlatRow[]) {
+function computeTotals(rows: ModelRow[]) {
   let requests = 0, inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, credits = 0
   for (const r of rows) {
     requests += r.usage.requests

@@ -5,6 +5,8 @@ WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
 RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 COPY admin-ui ./
+# 前端版本号读取根目录 Cargo.toml
+COPY Cargo.toml /app/Cargo.toml
 RUN pnpm build
 
 FROM rust:1.92-alpine AS builder

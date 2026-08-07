@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine } from 'lucide-react'
 
-const APP_VERSION = '2026.7.28'
+const APP_VERSION = __APP_VERSION__
 const GITHUB_REPO_URL = 'https://github.com/freebattle/kiro.rs'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -17,7 +17,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { CredentialCard } from '@/components/credential-card'
-import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
@@ -37,8 +36,6 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
-  const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
-  const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [socialLoginOpen, setSocialLoginOpen] = useState(false)
   const [idcLoginOpen, setIdcLoginOpen] = useState(false)
@@ -93,6 +90,9 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
+  const singleSelected = selectedIds.size === 1
+    ? data?.credentials.find(c => c.id === Array.from(selectedIds)[0])
+    : undefined
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -212,9 +212,29 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     document.documentElement.classList.toggle('dark')
   }
 
-  const handleViewBalance = (id: number) => {
-    setSelectedCredentialId(id)
-    setBalanceDialogOpen(true)
+  // 查询单个凭据余额，结果直接回填到卡片
+  const handleQueryBalance = async (id: number) => {
+    setLoadingBalanceIds(prev => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+
+    try {
+      const balance = await getCredentialBalance(id)
+      setBalanceMap(prev => new Map(prev).set(id, balance))
+      // 余额接口会回填邮箱/订阅等级，刷新列表以展示最新信息
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      toast.success(`凭据 #${id} 余额已更新`)
+    } catch (error) {
+      toast.error(`查询余额失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
   const handleRefresh = () => {
@@ -763,6 +783,17 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
                   </Button>
+                  {singleSelected && singleSelected.authMethod !== 'api_key' && (
+                    <Button
+                      onClick={() => setReloginTarget({ id: singleSelected.id, authMethod: singleSelected.authMethod })}
+                      size="sm"
+                      variant="outline"
+                      title="通过浏览器重新授权并更新 Token"
+                    >
+                      <KeyRound className="h-4 w-4 mr-2" />
+                      重新登录
+                    </Button>
+                  )}
                   <Button
                     onClick={handleBatchForceRefresh}
                     size="sm"
@@ -874,13 +905,12 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
-                    onViewBalance={handleViewBalance}
-                    onRelogin={(id, authMethod) => setReloginTarget({ id, authMethod })}
+                    onQueryBalance={handleQueryBalance}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -917,13 +947,6 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
           )}
         </div>
       </main>
-
-      {/* 余额对话框 */}
-      <BalanceDialog
-        credentialId={selectedCredentialId}
-        open={balanceDialogOpen}
-        onOpenChange={setBalanceDialogOpen}
-      />
 
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
