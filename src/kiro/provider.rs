@@ -198,8 +198,16 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽：AWS JSON 1.0 常见为 400 + ServiceQuotaExceededException，
+            // 不依赖 402。命中后禁用当前凭据并切换。
+            if endpoint.is_monthly_request_limit(&body) {
+                tracing::warn!(
+                    "MCP 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -362,8 +370,10 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽：按响应体识别（MONTHLY_REQUEST_COUNT /
+            // ServiceQuotaExceededException），不依赖 HTTP 402。
+            // AWS JSON 1.0 常见为 400，也可能是 402/429。
+            if endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -522,6 +532,11 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 报告指定凭据额度已用尽（流式响应里的 event-stream 异常会走这里）
+    pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        self.token_manager.report_quota_exhausted(id)
     }
 
     /// 获取远程可用模型列表（委托给 MultiTokenManager）

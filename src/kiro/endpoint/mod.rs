@@ -57,6 +57,9 @@ pub trait KiroEndpoint: Send + Sync {
     }
 
     /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
+    ///
+    /// 不依赖 HTTP 状态码：AWS JSON 1.0 的 `ServiceQuotaExceededException`
+    /// 常见为 400，而不是 402。
     fn is_monthly_request_limit(&self, body: &str) -> bool {
         default_is_monthly_request_limit(body)
     }
@@ -81,11 +84,15 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 默认的月度配额用尽判断逻辑
 ///
-/// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
+/// 识别：
+/// - 文本 / JSON 中的 `MONTHLY_REQUEST_COUNT`
+/// - AWS JSON 1.0 的 `ServiceQuotaExceededException`（`__type` 或异常名）
+/// - 顶层 `reason` 与嵌套 `error.reason`
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+    if body.contains("MONTHLY_REQUEST_COUNT") || body.contains("ServiceQuotaExceededException")
+    {
         return true;
     }
 
@@ -97,6 +104,14 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         .get("reason")
         .and_then(|v| v.as_str())
         .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    {
+        return true;
+    }
+
+    if value
+        .get("__type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.contains("ServiceQuotaExceededException"))
     {
         return true;
     }
@@ -132,6 +147,20 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_monthly_request_limit_aws_json_exception() {
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_monthly_request_limit_exception_type_only() {
+        assert!(default_is_monthly_request_limit(
+            "com.amazon.kiro.runtimeservice#ServiceQuotaExceededException"
+        ));
+        assert!(default_is_monthly_request_limit("ServiceQuotaExceededException"));
     }
 
     #[test]

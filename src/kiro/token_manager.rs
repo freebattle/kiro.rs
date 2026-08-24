@@ -1576,9 +1576,10 @@ impl MultiTokenManager {
 
     /// 报告指定凭据额度已用尽
     ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
+    /// 用于处理 `MONTHLY_REQUEST_COUNT` / `ServiceQuotaExceededException`：
     /// - 立即禁用该凭据（不等待连续失败阈值）
     /// - 切换到下一个可用凭据继续重试
+    /// - 持久化 disabled，避免重启后再次打到已用尽的凭据
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let result = {
@@ -1621,6 +1622,9 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("额度用尽后持久化禁用状态失败: {}", e);
+        }
         result
     }
 
@@ -3028,8 +3032,10 @@ mod tests {
 
         // 凭据会自动分配 ID（从 1 开始）
         assert_eq!(manager.available_count(), 2);
+        assert_eq!(manager.snapshot().current_id, 1);
         assert!(manager.report_quota_exhausted(1));
         assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.snapshot().current_id, 2);
 
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));

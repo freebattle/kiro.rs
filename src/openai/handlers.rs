@@ -288,6 +288,28 @@ async fn handle_non_stream(
     };
 
     let collected = collect_kiro_events(&body_bytes, &tool_name_map, model, input_tokens);
+    if collected.quota_exhausted {
+        tracing::warn!(
+            "非流式响应额度已用尽，禁用凭据 #{} 并切换",
+            credential_id
+        );
+        provider.report_quota_exhausted(credential_id);
+        log_failure(
+            &request_log,
+            model,
+            input_tokens,
+            cache_read_tokens,
+            start_time,
+            caller_name,
+            thinking_effort,
+            false,
+        );
+        return openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "You have reached the limit.",
+        );
+    }
     let output_tokens = estimate_output_tokens(&collected.text, &collected.tool_uses);
 
     let in_tok_for_resp = collected.input_tokens.unwrap_or(input_tokens);
@@ -351,6 +373,7 @@ struct CollectedOutput {
     tool_uses: Vec<CollectedToolUse>,
     input_tokens: Option<i32>,
     credits: f64,
+    quota_exhausted: bool,
 }
 
 struct CollectedToolUse {
@@ -374,12 +397,16 @@ fn collect_kiro_events(
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
+    let mut quota_exhausted = false;
 
     for result in decoder.decode_iter() {
         let Ok(frame) = result else { continue };
         let Ok(event) = KiroEvent::from_frame(frame) else {
             continue;
         };
+        if event.is_quota_exceeded() {
+            quota_exhausted = true;
+        }
         match event {
             Event::AssistantResponse(resp) => {
                 text.push_str(&resp.content);
@@ -434,6 +461,7 @@ fn collect_kiro_events(
         tool_uses,
         input_tokens: context_input_tokens,
         credits,
+        quota_exhausted,
     }
 }
 
@@ -637,6 +665,7 @@ async fn handle_stream(
             caller_name,
             thinking_effort,
             credential_id,
+            provider,
             full_text: String::new(),
             tool_uses: Vec::new(),
             tool_json_buffers: HashMap::new(),
@@ -757,6 +786,7 @@ struct StreamState {
     caller_name: Option<String>,
     thinking_effort: Option<String>,
     credential_id: u64,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     full_text: String,
     tool_uses: Vec<CollectedToolUse>,
     tool_json_buffers: HashMap<String, String>,
@@ -793,6 +823,13 @@ impl StreamState {
             let Ok(event) = KiroEvent::from_frame(frame) else {
                 continue;
             };
+            if event.is_quota_exceeded() {
+                tracing::warn!(
+                    "流式响应额度已用尽，禁用凭据 #{} 并切换",
+                    self.credential_id
+                );
+                self.provider.report_quota_exhausted(self.credential_id);
+            }
             match event {
                 Event::AssistantResponse(resp) => {
                     if resp.content.is_empty() {

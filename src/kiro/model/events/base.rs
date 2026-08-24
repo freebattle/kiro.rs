@@ -167,6 +167,29 @@ impl Event {
             message,
         })
     }
+
+    /// 是否为月度配额用尽（HTTP 200 的 event-stream 异常也会走这里）
+    pub fn is_quota_exceeded(&self) -> bool {
+        use crate::kiro::endpoint::default_is_monthly_request_limit;
+
+        match self {
+            Self::Exception {
+                exception_type,
+                message,
+            } => {
+                default_is_monthly_request_limit(exception_type)
+                    || default_is_monthly_request_limit(message)
+            }
+            Self::Error {
+                error_code,
+                error_message,
+            } => {
+                default_is_monthly_request_limit(error_code)
+                    || default_is_monthly_request_limit(error_message)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +226,20 @@ mod tests {
             EventType::ReasoningContent.as_str(),
             "reasoningContentEvent"
         );
+    }
+
+    #[test]
+    fn test_event_is_quota_exceeded() {
+        let quota = Event::Exception {
+            exception_type: "ServiceQuotaExceededException".to_string(),
+            message: r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#.to_string(),
+        };
+        assert!(quota.is_quota_exceeded());
+
+        let other = Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        };
+        assert!(!other.is_quota_exceeded());
     }
 }

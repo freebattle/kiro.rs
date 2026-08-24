@@ -496,6 +496,7 @@ async fn handle_stream_request(
         input_tokens,
         cache_read_tokens,
         credential_id,
+        provider,
         prompt_cache,
         session_fp,
         start_time,
@@ -531,6 +532,7 @@ fn create_sse_stream(
     input_tokens: i32,
     cache_read_tokens: i32,
     credential_id: u64,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     prompt_cache: Arc<PromptCacheTracker>,
     session_fp: u64,
     start_time: Instant,
@@ -549,7 +551,9 @@ fn create_sse_stream(
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)| async move {
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)| {
+        let provider = provider.clone();
+        async move {
             if finished {
                 return None;
             }
@@ -571,6 +575,13 @@ fn create_sse_stream(
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            if event.is_quota_exceeded() {
+                                                tracing::warn!(
+                                                    "流式响应额度已用尽，禁用凭据 #{} 并切换",
+                                                    credential_id
+                                                );
+                                                provider.report_quota_exhausted(credential_id);
+                                            }
                                             if !got_first_token {
                                                 if matches!(
                                                     &event,
@@ -677,6 +688,7 @@ fn create_sse_stream(
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_token_received, request_log, model, input_tokens, cache_read_tokens, credential_id, prompt_cache, session_fp, start_time, caller_name, thinking_effort)))
                 }
             }
+        }
         },
     )
     .flatten();
@@ -758,6 +770,7 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut credits: f64 = 0.0;
+    let mut quota_exhausted = false;
     // 来自 reasoningContentEvent（GPT 5.6）
     let mut reasoning_text: Option<String> = None;
     let mut reasoning_signature: Option<String> = None;
@@ -770,6 +783,9 @@ async fn handle_non_stream_request(
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
+                    if event.is_quota_exceeded() {
+                        quota_exhausted = true;
+                    }
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
@@ -855,6 +871,36 @@ async fn handle_non_stream_request(
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+
+    if quota_exhausted {
+        tracing::warn!(
+            "非流式响应额度已用尽，禁用凭据 #{} 并切换",
+            credential_id
+        );
+        provider.report_quota_exhausted(credential_id);
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let model_owned = model.to_string();
+        tokio::spawn(async move {
+            request_log.push(RequestRecord {
+                model: model_owned,
+                input_tokens,
+                output_tokens: 0,
+                cache_read_tokens,
+                ttft_ms: None,
+                duration_ms,
+                timestamp: now_ms(),
+                stream: false,
+                credential_id: Some(credential_id),
+                success: false,
+                credits: 0.0,
+                caller: caller_name,
+                thinking_effort,
+            });
+        });
+        return map_provider_error(anyhow::anyhow!(
+            "额度已用尽（MONTHLY_REQUEST_COUNT）"
+        ));
     }
 
     // 确定 stop_reason
