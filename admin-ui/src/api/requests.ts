@@ -41,6 +41,15 @@ export interface RequestLogResponse {
   pageSize: number
 }
 
+export interface ModelStats {
+  model: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  credits: number
+}
+
 export interface RequestStats {
   total: number
   successCount: number
@@ -50,6 +59,7 @@ export interface RequestStats {
   avgDurationMs: number
   avgTtftMs: number
   totalCredits: number
+  byModel?: ModelStats[]
 }
 
 export interface ModelUsage {

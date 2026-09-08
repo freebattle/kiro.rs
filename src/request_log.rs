@@ -2,7 +2,7 @@
 //!
 //! 内存环形缓冲区存储请求记录，仅保留当天数据，异步写入不阻塞核心流程。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -171,6 +171,28 @@ impl RequestLogStore {
             }
         };
 
+        let mut by_model_map: HashMap<String, ModelStats> = HashMap::new();
+        for r in &today {
+            let entry = by_model_map.entry(r.model.clone()).or_default();
+            entry.requests += 1;
+            entry.input_tokens += r.input_tokens as i64;
+            entry.output_tokens += r.output_tokens as i64;
+            entry.cache_read_tokens += r.cache_read_tokens as i64;
+            entry.credits += r.credits;
+        }
+        let mut by_model: Vec<ModelStats> = by_model_map
+            .into_iter()
+            .map(|(model, mut stats)| {
+                stats.model = model;
+                stats
+            })
+            .collect();
+        by_model.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+
         RequestStats {
             total,
             success_count,
@@ -180,8 +202,20 @@ impl RequestLogStore {
             avg_duration_ms,
             avg_ttft_ms,
             total_credits,
+            by_model,
         }
     }
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStats {
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub credits: f64,
 }
 
 #[derive(Serialize)]
@@ -195,6 +229,7 @@ pub struct RequestStats {
     pub avg_duration_ms: u64,
     pub avg_ttft_ms: u64,
     pub total_credits: f64,
+    pub by_model: Vec<ModelStats>,
 }
 
 fn today_start_ms() -> u64 {
@@ -207,4 +242,56 @@ fn today_start_ms() -> u64 {
     let day_secs = 86400u64;
     let today_start_utc = ((now + offset_secs) / day_secs) * day_secs - offset_secs;
     today_start_utc * 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record(model: &str, input: i32, output: i32, cache: i32, credits: f64) -> RequestRecord {
+        RequestRecord {
+            model: model.to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache,
+            ttft_ms: None,
+            duration_ms: 100,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            stream: false,
+            credential_id: Some(1),
+            success: true,
+            credits,
+            caller: None,
+            thinking_effort: None,
+        }
+    }
+
+    #[test]
+    fn today_stats_aggregates_by_model() {
+        let store = RequestLogStore::new();
+        store.push(sample_record("claude-sonnet-4-5", 100, 20, 10, 0.1));
+        store.push(sample_record("claude-sonnet-4-5", 50, 10, 5, 0.05));
+        store.push(sample_record("claude-opus-4-5", 200, 40, 0, 0.4));
+
+        let stats = store.get_today_stats();
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.by_model.len(), 2);
+
+        assert_eq!(stats.by_model[0].model, "claude-sonnet-4-5");
+        assert_eq!(stats.by_model[0].requests, 2);
+        assert_eq!(stats.by_model[0].input_tokens, 150);
+        assert_eq!(stats.by_model[0].output_tokens, 30);
+        assert_eq!(stats.by_model[0].cache_read_tokens, 15);
+        assert!((stats.by_model[0].credits - 0.15).abs() < 1e-9);
+
+        assert_eq!(stats.by_model[1].model, "claude-opus-4-5");
+        assert_eq!(stats.by_model[1].requests, 1);
+        assert_eq!(stats.by_model[1].input_tokens, 200);
+        assert_eq!(stats.by_model[1].output_tokens, 40);
+        assert_eq!(stats.by_model[1].cache_read_tokens, 0);
+        assert!((stats.by_model[1].credits - 0.4).abs() < 1e-9);
+    }
 }

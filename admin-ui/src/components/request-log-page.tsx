@@ -152,8 +152,54 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
           </div>
         )}
 
+        {/* 按模型汇总 */}
+        {stats?.byModel && stats.byModel.length > 0 && (
+          <Card className="mb-6">
+            <CardHeader>
+              <CardTitle className="text-base">按模型统计</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b bg-muted/50">
+                      <th className="text-left p-3 font-medium">模型</th>
+                      <th className="text-right p-3 font-medium">请求数</th>
+                      <th className="text-right p-3 font-medium">Credits</th>
+                      <th className="text-right p-3 font-medium">输入 Tokens</th>
+                      <th className="text-right p-3 font-medium">输出 Tokens</th>
+                      <th className="text-right p-3 font-medium">模拟缓存</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stats.byModel.map((row) => (
+                      <tr key={row.model} className="border-b hover:bg-muted/30">
+                        <td className="p-3 font-mono text-xs">{shortenModel(row.model)}</td>
+                        <td className="p-3 text-right tabular-nums">{row.requests.toLocaleString()}</td>
+                        <td className="p-3 text-right tabular-nums text-amber-600">
+                          {row.credits > 0 ? formatCredits(row.credits) : '-'}
+                        </td>
+                        <td className="p-3 text-right tabular-nums">
+                          {Math.max(0, row.inputTokens - row.cacheReadTokens).toLocaleString()}
+                        </td>
+                        <td className="p-3 text-right tabular-nums">{row.outputTokens.toLocaleString()}</td>
+                        <td className="p-3 text-right tabular-nums text-green-500">
+                          {row.cacheReadTokens > 0 ? formatTokenCount(row.cacheReadTokens) : '-'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* 请求记录表格 */}
         <Card>
+          <CardHeader>
+            <CardTitle className="text-base">请求明细</CardTitle>
+          </CardHeader>
           <CardContent className="p-0">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
