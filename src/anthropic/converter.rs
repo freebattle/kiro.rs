@@ -587,7 +587,7 @@ fn effort_token(cfg: Option<&crate::anthropic::types::OutputConfig>) -> Option<&
         .filter(|e| !e.is_empty())
 }
 
-fn payload_effort(req: &MessagesRequest, model_id: &str) -> Option<&str> {
+fn payload_effort<'a>(req: &'a MessagesRequest, model_id: &str) -> Option<&'a str> {
     let output = effort_token(req.output_config.as_ref());
     let reasoning = effort_token(req.reasoning.as_ref());
     if is_gpt_upstream_model(model_id) {
