@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Tool};
 
 use super::input::extract_additional_tools;
-use super::types::{OpenAIMessage, ResponsesRequest, ResponsesTool};
+use super::types::{OpenAIMessage, ReasoningConfig, ResponsesRequest, ResponsesTool};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: i32 = 16384;
 
@@ -129,13 +129,21 @@ pub fn responses_to_anthropic(
         tools: tools.clone(),
         tool_choice: sanitize_tool_choice(req.tool_choice.as_ref(), tools.as_ref()),
         thinking: None,
-        output_config: req.reasoning.as_ref().and_then(|reasoning| {
-            reasoning.effort.as_ref().map(|effort| crate::anthropic::types::OutputConfig {
-                effort: effort.clone(),
-            })
-        }),
+        output_config: effort_to_output_config(req.output_config.as_ref()),
+        reasoning: effort_to_output_config(req.reasoning.as_ref()),
         metadata: None,
     })
+}
+
+fn effort_to_output_config(
+    cfg: Option<&ReasoningConfig>,
+) -> Option<crate::anthropic::types::OutputConfig> {
+    cfg.and_then(|c| c.effort.as_ref())
+        .map(|effort| effort.trim())
+        .filter(|effort| !effort.is_empty())
+        .map(|effort| crate::anthropic::types::OutputConfig {
+            effort: effort.to_string(),
+        })
 }
 
 /// 丢弃指向服务端工具（web_search 等）的 tool_choice，避免污染上游。
@@ -504,11 +512,47 @@ mod tests {
             reasoning: Some(crate::openai::types::ReasoningConfig {
                 effort: Some("low".to_string()),
             }),
+            output_config: None,
             metadata: None,
         };
         let out = responses_to_anthropic(&req, &[OpenAIMessage::user_text("hi")]).unwrap();
 
-        assert_eq!(out.output_config.unwrap().effort, "low");
+        assert_eq!(out.reasoning.as_ref().unwrap().effort, "low");
+        assert!(out.output_config.is_none());
+        let kiro = crate::anthropic::converter::convert_request(&out).expect("convert");
+        assert_eq!(
+            kiro.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn test_output_config_effort_passthrough_for_claude() {
+        let req = ResponsesRequest {
+            model: "claude-opus-5".to_string(),
+            input: json!("hi"),
+            instructions: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            previous_response_id: None,
+            store: None,
+            temperature: None,
+            max_output_tokens: None,
+            reasoning: None,
+            output_config: Some(crate::openai::types::ReasoningConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let out = responses_to_anthropic(&req, &[OpenAIMessage::user_text("hi")]).unwrap();
+        assert_eq!(out.output_config.as_ref().unwrap().effort, "max");
+        assert!(out.reasoning.is_none());
+        let kiro = crate::anthropic::converter::convert_request(&out).expect("convert");
+        assert_eq!(
+            kiro.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "max"
+        );
     }
 
     #[test]
@@ -525,6 +569,7 @@ mod tests {
             temperature: None,
             max_output_tokens: Some(1024),
             reasoning: None,
+            output_config: None,
             metadata: None,
         };
         let messages = vec![
@@ -560,6 +605,7 @@ mod tests {
             temperature: None,
             max_output_tokens: None,
             reasoning: None,
+            output_config: None,
             metadata: None,
         };
         let messages = vec![
@@ -696,6 +742,7 @@ mod tests {
             temperature: None,
             max_output_tokens: Some(32),
             reasoning: None,
+            output_config: None,
             metadata: None,
         };
         let messages = vec![OpenAIMessage::user_text("hi")];

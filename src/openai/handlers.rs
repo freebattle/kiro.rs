@@ -1251,6 +1251,13 @@ fn resolve_thinking_effort(payload: &ResponsesRequest) -> Option<String> {
         .as_ref()
         .and_then(|reasoning| reasoning.effort.as_deref())
         .filter(|effort| !effort.is_empty())
+        .or_else(|| {
+            payload
+                .output_config
+                .as_ref()
+                .and_then(|cfg| cfg.effort.as_deref())
+                .filter(|effort| !effort.is_empty())
+        })
         .map(str::to_string)
         .or_else(|| {
             converter::is_gpt_upstream_model(&payload.model).then(|| "high".to_string())

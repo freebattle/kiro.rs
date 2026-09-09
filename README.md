@@ -494,7 +494,9 @@ Claude extended thinking：
 }
 ```
 
-adaptive + effort（**Sonnet / Opus / GPT**；**Haiku 不支持 effort，不会发送该字段**）：
+adaptive + effort（**Sonnet / Opus / GPT**；**Haiku 不支持 effort，不会发送该字段**）。
+
+Anthropic Messages 与 Responses 都同时认 `output_config.effort` 和 `reasoning.effort`：GPT 优先 `reasoning`，Claude 优先 `output_config`，缺了再读另一个。
 
 ```json
 {
@@ -502,6 +504,16 @@ adaptive + effort（**Sonnet / Opus / GPT**；**Haiku 不支持 effort，不会�
   "max_tokens": 16000,
   "thinking": { "type": "adaptive" },
   "output_config": { "effort": "high" },
+  "messages": []
+}
+```
+
+```json
+{
+  "model": "gpt-5.6-luna",
+  "max_tokens": 16000,
+  "thinking": { "type": "adaptive" },
+  "reasoning": { "effort": "xhigh" },
   "messages": []
 }
 ```

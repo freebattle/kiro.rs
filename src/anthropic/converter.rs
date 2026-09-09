@@ -581,14 +581,26 @@ fn build_additional_model_request_fields(
     }))
 }
 
+fn effort_token(cfg: Option<&crate::anthropic::types::OutputConfig>) -> Option<&str> {
+    cfg.map(|c| c.effort.as_str())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+}
+
+fn payload_effort(req: &MessagesRequest, model_id: &str) -> Option<&str> {
+    let output = effort_token(req.output_config.as_ref());
+    let reasoning = effort_token(req.reasoning.as_ref());
+    if is_gpt_upstream_model(model_id) {
+        reasoning.or(output)
+    } else {
+        output.or(reasoning)
+    }
+}
+
 fn resolve_effort(req: &MessagesRequest, model_id: &str) -> String {
     let default = default_effort_for_model(model_id);
     let allowed = allowed_efforts(model_id);
-    let requested = req
-        .output_config
-        .as_ref()
-        .map(|c| c.effort.as_str())
-        .filter(|e| !e.is_empty())
+    let requested = payload_effort(req, model_id)
         .and_then(normalize_effort_token)
         .or_else(|| {
             req.thinking.as_ref().and_then(|t| {
@@ -1402,6 +1414,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -1522,6 +1535,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
 
@@ -1591,6 +1605,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
 
@@ -1648,6 +1663,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
 
@@ -1732,6 +1748,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            reasoning: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -1764,6 +1781,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
 
@@ -2273,6 +2291,7 @@ mod tests {
             output_config: Some(OutputConfig {
                 effort: "high".to_string(),
             }),
+            reasoning: None,
             metadata: None,
         };
 
@@ -2443,6 +2462,7 @@ mod tests {
             output_config: Some(OutputConfig {
                 effort: "medium".to_string(),
             }),
+            reasoning: None,
             metadata: None,
         };
 
@@ -2483,6 +2503,7 @@ mod tests {
             output_config: Some(OutputConfig {
                 effort: "high".to_string(),
             }),
+            reasoning: None,
             metadata: None,
         };
         let result = convert_request(&req).expect("haiku convert");
@@ -2509,6 +2530,7 @@ mod tests {
             output_config: effort.map(|e| OutputConfig {
                 effort: e.to_string(),
             }),
+            reasoning: None,
             metadata: None,
         }
     }
@@ -2625,12 +2647,72 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
         let result = convert_request(&req).expect("convert");
         assert_eq!(
             result.additional_model_request_fields.unwrap()["reasoning"]["effort"],
             "none"
+        );
+    }
+
+    #[test]
+    fn test_gpt_reads_reasoning_effort_over_adaptive_thinking() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking};
+        let req = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            reasoning: Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+        };
+        let result = convert_request(&req).expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn test_claude_reads_reasoning_effort_when_output_config_missing() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
+        let req = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            reasoning: Some(OutputConfig {
+                effort: "max".to_string(),
+            }),
+            metadata: None,
+        };
+        let result = convert_request(&req).expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "max"
         );
     }
 
@@ -2675,6 +2757,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            reasoning: None,
             metadata: None,
         };
 

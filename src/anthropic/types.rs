@@ -126,6 +126,9 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    /// 程小帮 / 部分客户端在 Anthropic Messages 上给 GPT 写 `reasoning.effort`
+    #[serde(default)]
+    pub reasoning: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }

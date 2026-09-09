@@ -31,6 +31,9 @@ pub struct ResponsesRequest {
     /// OpenAI Responses reasoning configuration.
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    /// 部分客户端在 Responses 上给 Claude 写 `output_config.effort`
+    #[serde(default)]
+    pub output_config: Option<ReasoningConfig>,
     #[serde(default)]
     pub metadata: Option<std::collections::HashMap<String, String>>,
 }
@@ -397,6 +400,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.reasoning.unwrap().effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_responses_request_deserializes_output_config_effort() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-5",
+            "input": "hi",
+            "output_config": {"effort": "max"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.output_config.unwrap().effort.as_deref(),
+            Some("max")
+        );
     }
 
     #[test]

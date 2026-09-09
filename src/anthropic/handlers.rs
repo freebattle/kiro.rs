@@ -403,7 +403,19 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
-    let thinking_effort = payload.output_config.as_ref().map(|c| c.effort.clone());
+    let thinking_effort = payload
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.as_str())
+        .filter(|e| !e.is_empty())
+        .or_else(|| {
+            payload
+                .reasoning
+                .as_ref()
+                .map(|c| c.effort.as_str())
+                .filter(|e| !e.is_empty())
+        })
+        .map(str::to_string);
 
     let tool_name_map = conversion_result.tool_name_map;
 
