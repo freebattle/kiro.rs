@@ -4,7 +4,7 @@
 //! 支持多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use parking_lot::Mutex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,49 @@ pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
 /// 检查 Token 是否即将过期（10分钟内）
 pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
     is_token_expiring_within(credentials, 10).unwrap_or(false)
+}
+
+/// 月度额度恢复时刻：每月 1 日 00:30 UTC（北京时间 08:30）
+///
+/// 上游在 00:00 UTC 刷新额度，推迟 30 分钟再查，避开同步延迟。
+pub(crate) fn monthly_quota_reset_at(year: i32, month: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(year, month, 1, 0, 30, 0)
+        .single()
+        .expect("valid UTC datetime")
+}
+
+/// 最近一次已经到达的月度恢复点（now 早于本月 1 日 00:30 时回退到上月）
+pub(crate) fn last_completed_quota_reset(now: DateTime<Utc>) -> DateTime<Utc> {
+    let this_reset = monthly_quota_reset_at(now.year(), now.month());
+    if now >= this_reset {
+        this_reset
+    } else if now.month() == 1 {
+        monthly_quota_reset_at(now.year() - 1, 12)
+    } else {
+        monthly_quota_reset_at(now.year(), now.month() - 1)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn next_monthly_quota_reset(now: DateTime<Utc>) -> DateTime<Utc> {
+    let this_reset = monthly_quota_reset_at(now.year(), now.month());
+    if now < this_reset {
+        return this_reset;
+    }
+    if now.month() == 12 {
+        monthly_quota_reset_at(now.year() + 1, 1)
+    } else {
+        monthly_quota_reset_at(now.year(), now.month() + 1)
+    }
+}
+
+fn quota_exhausted_before_reset(credentials: &KiroCredentials, reset_at: DateTime<Utc>) -> bool {
+    credentials
+        .quota_exhausted_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc) < reset_at)
+        .unwrap_or(false)
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -903,10 +946,12 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
-                    } else {
+                    disabled_reason: if !cred.disabled {
                         None
+                    } else if cred.quota_exhausted_at.is_some() {
+                        Some(DisabledReason::QuotaExceeded)
+                    } else {
+                        Some(DisabledReason::Manual)
                     },
                     success_count: 0,
                     last_used_at: None,
@@ -1373,6 +1418,9 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    if e.disabled_reason != Some(DisabledReason::QuotaExceeded) {
+                        cred.quota_exhausted_at = None;
+                    }
                     cred
                 })
                 .collect()
@@ -1597,6 +1645,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.credentials.quota_exhausted_at = Some(Utc::now().to_rfc3339());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
@@ -1626,6 +1675,132 @@ impl MultiTokenManager {
             tracing::warn!("额度用尽后持久化禁用状态失败: {}", e);
         }
         result
+    }
+
+    /// 找出本月额度重置后应恢复的凭据（额度用尽时间早于最近一次已到达的 1 日 00:30 UTC）
+    fn quota_recovery_candidates(&self, now: DateTime<Utc>) -> Vec<u64> {
+        let reset_at = last_completed_quota_reset(now);
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                e.disabled_reason == Some(DisabledReason::QuotaExceeded)
+                    && quota_exhausted_before_reset(&e.credentials, reset_at)
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 重新启用指定的额度用尽凭据，并按优先级切回可用凭据
+    fn reenable_quota_exhausted(&self, ids: &[u64]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let mut enabled_ids = Vec::new();
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if !ids.contains(&entry.id) {
+                    continue;
+                }
+                if entry.disabled_reason != Some(DisabledReason::QuotaExceeded) {
+                    continue;
+                }
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.credentials.quota_exhausted_at = None;
+                enabled_ids.push(entry.id);
+            }
+        }
+        if enabled_ids.is_empty() {
+            return 0;
+        }
+        tracing::info!(
+            "月度额度重置后已重新启用 {} 个凭据: {:?}",
+            enabled_ids.len(),
+            enabled_ids
+        );
+        self.select_highest_priority();
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("额度恢复后持久化失败: {}", e);
+        }
+        enabled_ids.len()
+    }
+
+    /// 月度额度重置后刷新因额度用尽禁用的凭据余额，有剩余则重新启用。
+    ///
+    /// 查询失败时仍启用（重置时刻固定，若实际仍无额度会在下次请求再次禁用）。
+    pub async fn recover_quota_exhausted_after_reset(&self) -> usize {
+        self.recover_quota_exhausted_as_of(Utc::now()).await
+    }
+
+    async fn recover_quota_exhausted_as_of(&self, now: DateTime<Utc>) -> usize {
+        let reset_at = last_completed_quota_reset(now);
+        let ids = self.quota_recovery_candidates(now);
+        if ids.is_empty() {
+            return 0;
+        }
+
+        tracing::info!(
+            "月度额度重置（{} UTC），刷新 {} 个因额度用尽禁用的凭据余额",
+            reset_at,
+            ids.len()
+        );
+
+        let mut to_enable = Vec::new();
+        let mut still_exhausted = Vec::new();
+        for id in ids {
+            match self.get_usage_limits_for(id).await {
+                Ok(usage) => {
+                    let remaining = (usage.usage_limit() - usage.current_usage()).max(0.0);
+                    if remaining > 0.0 {
+                        tracing::info!(
+                            "凭据 #{} 余额已刷新，剩余 {:.1}，将重新启用",
+                            id,
+                            remaining
+                        );
+                        to_enable.push(id);
+                    } else {
+                        tracing::info!("凭据 #{} 月度重置后仍无剩余额度，保持禁用", id);
+                        still_exhausted.push(id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "凭据 #{} 刷新余额失败（{}），按月度重置直接启用",
+                        id,
+                        e
+                    );
+                    to_enable.push(id);
+                }
+            }
+        }
+
+        self.mark_quota_still_exhausted(&still_exhausted, now);
+        self.reenable_quota_exhausted(&to_enable)
+    }
+
+    /// 本月已确认无额度：把用尽时间推到现在，避免每小时轮询重复查询
+    fn mark_quota_still_exhausted(&self, ids: &[u64], now: DateTime<Utc>) {
+        if ids.is_empty() {
+            return;
+        }
+        let stamp = now.to_rfc3339();
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if ids.contains(&entry.id)
+                    && entry.disabled_reason == Some(DisabledReason::QuotaExceeded)
+                {
+                    entry.credentials.quota_exhausted_at = Some(stamp.clone());
+                }
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("更新额度用尽时间失败: {}", e);
+        }
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -1856,8 +2031,10 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.credentials.quota_exhausted_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.credentials.quota_exhausted_at = None;
             }
         }
         // 持久化更改
@@ -1900,6 +2077,7 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.credentials.quota_exhausted_at = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -3067,6 +3245,159 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    fn utc_ymdhms(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, sec)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_next_monthly_quota_reset() {
+        assert_eq!(
+            next_monthly_quota_reset(utc_ymdhms(2026, 1, 15, 12, 0, 0)),
+            utc_ymdhms(2026, 2, 1, 0, 30, 0)
+        );
+        assert_eq!(
+            next_monthly_quota_reset(utc_ymdhms(2026, 1, 1, 0, 0, 0)),
+            utc_ymdhms(2026, 1, 1, 0, 30, 0)
+        );
+        assert_eq!(
+            next_monthly_quota_reset(utc_ymdhms(2026, 1, 1, 0, 30, 0)),
+            utc_ymdhms(2026, 2, 1, 0, 30, 0)
+        );
+        assert_eq!(
+            next_monthly_quota_reset(utc_ymdhms(2026, 12, 31, 23, 59, 59)),
+            utc_ymdhms(2027, 1, 1, 0, 30, 0)
+        );
+        assert_eq!(
+            last_completed_quota_reset(utc_ymdhms(2026, 3, 8, 8, 0, 0)),
+            utc_ymdhms(2026, 3, 1, 0, 30, 0)
+        );
+        assert_eq!(
+            last_completed_quota_reset(utc_ymdhms(2026, 3, 1, 0, 10, 0)),
+            utc_ymdhms(2026, 2, 1, 0, 30, 0)
+        );
+    }
+
+    #[test]
+    fn test_quota_recovery_candidates_skips_current_month_and_manual() {
+        let mut last_month = KiroCredentials::default();
+        last_month.disabled = true;
+        last_month.quota_exhausted_at = Some("2026-01-20T12:00:00Z".to_string());
+
+        let mut this_month = KiroCredentials::default();
+        this_month.disabled = true;
+        this_month.quota_exhausted_at = Some("2026-02-10T12:00:00Z".to_string());
+
+        let mut manual = KiroCredentials::default();
+        manual.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![last_month, this_month, manual],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let now = utc_ymdhms(2026, 2, 15, 0, 0, 0);
+        let candidates = manager.quota_recovery_candidates(now);
+        assert_eq!(candidates, vec![1]);
+
+        // 1 日 00:30 之前仍属上月账期，不提前恢复
+        let before_delay = utc_ymdhms(2026, 2, 1, 0, 10, 0);
+        assert!(manager.quota_recovery_candidates(before_delay).is_empty());
+
+        // 本月已确认无额度后，小时轮询不应再把它当候选
+        manager.mark_quota_still_exhausted(&[1], utc_ymdhms(2026, 2, 1, 1, 0, 0));
+        assert!(
+            manager
+                .quota_recovery_candidates(utc_ymdhms(2026, 2, 15, 0, 0, 0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_reenable_quota_exhausted_only_quota_reason() {
+        let mut last_month = KiroCredentials::default();
+        last_month.disabled = true;
+        last_month.quota_exhausted_at = Some("2026-01-20T12:00:00Z".to_string());
+
+        let mut manual = KiroCredentials::default();
+        manual.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![last_month, manual],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count(), 0);
+        let enabled = manager.reenable_quota_exhausted(&[1, 2]);
+        assert_eq!(enabled, 1);
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        let second = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!first.disabled);
+        assert_eq!(first.disabled_reason, None);
+        assert!(second.disabled);
+        assert_eq!(second.disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(snapshot.current_id, 1);
+    }
+
+    #[test]
+    fn test_quota_exhausted_reason_restored_and_persisted() {
+        let cred_path =
+            std::env::temp_dir().join(format!("kiro-quota-{}.json", uuid::Uuid::new_v4()));
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.report_quota_exhausted(1);
+
+        let json = std::fs::read_to_string(&cred_path).unwrap();
+        let loaded: Vec<KiroCredentials> = serde_json::from_str(&json).unwrap();
+        assert!(loaded[0].disabled);
+        assert!(loaded[0].quota_exhausted_at.is_some());
+
+        let manager2 = MultiTokenManager::new(
+            Config::default(),
+            loaded,
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+        let snapshot = manager2.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("QuotaExceeded")
+        );
+
+        let now = Utc::now() + Duration::days(40);
+        let candidates = manager2.quota_recovery_candidates(now);
+        assert_eq!(candidates, vec![1]);
+        manager2.reenable_quota_exhausted(&candidates);
+        assert_eq!(manager2.available_count(), 1);
+
+        let json = std::fs::read_to_string(&cred_path).unwrap();
+        let reloaded: Vec<KiroCredentials> = serde_json::from_str(&json).unwrap();
+        assert!(!reloaded[0].disabled);
+        assert!(reloaded[0].quota_exhausted_at.is_none());
+
+        let _ = std::fs::remove_file(&cred_path);
     }
 
     // ============ 凭据级 Region 优先级测试 ============

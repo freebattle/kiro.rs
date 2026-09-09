@@ -116,6 +116,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 因月度额度用尽被禁用的时间（RFC3339）
+    ///
+    /// 仅额度用尽自动禁用时写入。每月 1 日 00:30 UTC 重置后，
+    /// 若该时间早于最近一次已到达的重置点则重新启用。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_exhausted_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -442,6 +450,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -565,6 +574,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -601,6 +611,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -720,6 +731,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -909,5 +921,20 @@ mod tests {
         creds.api_region = Some("api-only".to_string());
         assert_eq!(creds.effective_auth_region(), "auth-only");
         assert_eq!(creds.effective_api_region(), "api-only");
+    }
+
+    #[test]
+    fn test_quota_exhausted_at_roundtrip() {
+        let json = r#"{"disabled":true,"quotaExhaustedAt":"2026-01-15T00:00:00Z"}"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert!(creds.disabled);
+        assert_eq!(
+            creds.quota_exhausted_at.as_deref(),
+            Some("2026-01-15T00:00:00Z")
+        );
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("quotaExhaustedAt"));
+        assert!(serialized.contains("2026-01-15T00:00:00Z"));
     }
 }

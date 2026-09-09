@@ -176,26 +176,19 @@ async fn main() {
         None => OptionalDebugLogger::none(),
     };
 
-    // 启动定时清理任务（每小时清理非当天数据）
+    // 每小时管家任务：日志清理、过期 Responses、月度额度恢复
+    // interval 首次 tick 立即完成，启动时会补做一次额度检查
     {
         let log_clone = request_log.clone();
+        let store = openai::ResponseStore::new("data/responses");
+        let quota_manager = token_manager.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 log_clone.cleanup_old();
-            }
-        });
-    }
-
-    // 定期清理过期 Responses 持久化（默认 30 天 TTL）
-    {
-        let store = openai::ResponseStore::new("data/responses");
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                interval.tick().await;
                 store.purge_expired();
+                quota_manager.recover_quota_exhausted_after_reset().await;
             }
         });
     }
