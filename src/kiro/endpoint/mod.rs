@@ -34,7 +34,7 @@ pub trait KiroEndpoint: Send + Sync {
     /// MCP endpoint URL
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
 
-    /// API 请求 Content-Type（Kiro 1.0.138+ IDE 端点为 application/x-amz-json-1.0）
+    /// API 请求 Content-Type（Kiro 1.0.437 IDE 端点为 application/x-amz-json-1.0）
     fn api_content_type(&self) -> &'static str {
         "application/json"
     }

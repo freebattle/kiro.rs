@@ -20,9 +20,9 @@ HTTPS 固定使用 **rustls**。若代理/企业证书环境异常，请安装�
 
 - **Anthropic API 兼容**: 完整支持 `/v1/messages`、流式 SSE、thinking、tool use
 - **OpenAI Responses 兼容**: 支持 `/v1/responses`（Codex / `wire_api=responses`），含 `previous_response_id`、自定义工具、`additional_tools`
-- **GPT-5.6 上游**: 支持 `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra`（`gpt-5.6` 默认 luna），自动注入 `reasoning.effort`
-- **Claude 1.0.138 协议**: IDE Runtime 端点（`x-amz-target` + `application/x-amz-json-1.0`）、`agentMode=vibe`、`output_config.effort`（Sonnet/Opus）
-- **模型能力区分**: Haiku 不发送 `additionalModelRequestFields`（上游不支持思考强度）
+- **GPT-5.6 上游**: 支持 `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra`（`gpt-5.6` 默认 luna），`reasoning.effort` 透传 `none|low|medium|high|xhigh|max`
+- **Claude 1.0.437 协议**: IDE Runtime 端点（`x-amz-target` + `application/x-amz-json-1.0`）、`agentMode=vibe`、`KAS/0.54.0` UA、`output_config.effort`（Opus/Sonnet 4.6+ / 5）
+- **模型能力区分**: Haiku / Claude 4.5 不发送 `additionalModelRequestFields`（上游无思考强度 schema）
 - **流式响应**: SSE 流式输出，含 ping 保活
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **Kiro API Key 认证**: 支持 `kiroApiKey` / `KIRO_API_KEY` headless 凭据
@@ -100,7 +100,7 @@ cargo build --release
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "region": "us-east-1",
-  "kiroVersion": "1.0.138"
+  "kiroVersion": "1.0.437"
 }
 ```
 
@@ -508,11 +508,13 @@ adaptive + effort（**Sonnet / Opus / GPT**；**Haiku 不支持 effort，不会�
 
 上游字段映射：
 
-| 模型 | additionalModelRequestFields |
-|------|------------------------------|
-| GPT-5.6-luna | `{ "reasoning": { "effort": "high" } }` |
-| Claude Sonnet / Opus | `{ "output_config": { "effort": "medium\|high\|..." } }` |
-| Claude Haiku | **不发送** |
+| 模型 | additionalModelRequestFields | 合法 effort |
+|------|------------------------------|-------------|
+| GPT-5.6-luna / sol / terra | `{ "reasoning": { "effort": "..." } }` | `none\|low\|medium\|high\|xhigh\|max`（默认 `high`） |
+| Claude Opus 5 / Sonnet 5 / Opus 4.8 | `{ "output_config": { "effort": "..." } }` | `low\|medium\|high\|xhigh\|max`（默认 `high`） |
+| Claude Opus 4.7 | `{ "output_config": { "effort": "..." } }` | 同上（默认 `xhigh`） |
+| Claude Opus 4.6 / Sonnet 4.6 | `{ "output_config": { "effort": "..." } }` | `low\|medium\|high\|max`（无 `xhigh`） |
+| Claude 4.5 / Haiku | **不发送** | — |
 
 ### 工具调用
 
@@ -548,11 +550,12 @@ Claude 客户端 ID 会做新旧格式兼容（`claude-opus-4-8` ↔ `claude-opu
 |------------|--------------|------|
 | `claude-*-x-y` / `claude-*-x.y` | 对应 `claude-*-x.y` | 版本号格式兼容 |
 | `*haiku*` | `claude-haiku-4.5` | 无 thinking effort |
+| `claude-opus-5` / `claude-sonnet-5` | 同名上游 ID | 1M 上下文，带 effort |
 | `gpt-5.6` / `gpt-5-6` | `gpt-5.6-luna` | GPT 默认别名 |
 | `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra` | 同名上游 ID | GPT 5.6 变体 |
 | 其他非 Claude/GPT | 不支持 | 返回模型错误 |
 
-上下文窗口：Opus 4.6+ / Sonnet 4.6+ 按 1M 估算，其余约 200K。
+上下文窗口：Opus/Sonnet 5 与 4.6+ 按 1M 估算，GPT 5.6 约 272K，其余约 200K。
 
 ## Admin（可选）
 
@@ -613,8 +616,8 @@ git push -u origin master
 1. **凭证安全**：`credentials.json` / `apiKey` / `adminApiKey` 不要提交版本库，生产环境权限尽量 `600`
 2. **Token 刷新**：服务会自动刷新过期 Token
 3. **相对路径数据**：`data/usage_stats`、`data/responses`、`debugLogDir` 相对进程工作目录
-4. **Haiku**：不能设置思考强度；若客户端仍带 `output_config.effort`，本服务会自动忽略
-5. **GPT / Opus 4.8**：依赖较新的 Kiro Runtime 协议字段（`agentMode`、effort 等）；协议指纹已内置，升级二进制即可
+4. **Haiku / Claude 4.5**：不能设置思考强度；若客户端仍带 `output_config.effort`，本服务会自动忽略
+5. **GPT / Claude 5 / Opus 4.8**：依赖 Kiro Runtime 1.0.437 协议字段（`agentMode`、effort、`KAS` UA 等）；协议指纹已内置，升级二进制即可
 6. **WebSearch 工具**：Anthropic 路径下仅单个 `web_search` 工具时走内置转换逻辑；Responses 路径会丢弃 server-side web_search 定义以免上游校验失败
 
 ## 项目结构

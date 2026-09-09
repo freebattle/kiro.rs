@@ -85,6 +85,9 @@ pub struct ConversationState {
     pub current_message: CurrentMessage,
     /// 会话 ID
     pub conversation_id: String,
+    /// 根会话 ID（官方 1.0.437：`sess_{uuid}`，贯穿 title / 主对话 / 工具回灌）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_conversation_id: Option<String>,
     /// 历史消息列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Message>,
@@ -99,6 +102,7 @@ impl ConversationState {
             chat_trigger_type: None,
             current_message: CurrentMessage::default(),
             conversation_id: conversation_id.into(),
+            root_conversation_id: None,
             history: Vec::new(),
         }
     }
@@ -130,6 +134,12 @@ impl ConversationState {
     /// 添加历史消息
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
         self.history = history;
+        self
+    }
+
+    /// 设置根会话 ID
+    pub fn with_root_conversation_id(mut self, id: impl Into<String>) -> Self {
+        self.root_conversation_id = Some(id.into());
         self
     }
 }

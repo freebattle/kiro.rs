@@ -215,23 +215,43 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
+/// 解析 Claude 家族版本 `(major, minor)`。
+///
+/// - `claude-opus-5` → `(5, 0)`
+/// - `claude-sonnet-4.6` / `claude-sonnet-4-6` → `(4, 6)`
+/// - 日期型 ID（`claude-opus-4-20250514`）只取主版本 `(4, 0)`
+fn parse_claude_family_version(model: &str) -> Option<(u32, u32)> {
+    let lower = model.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("claude-opus-")
+        .or_else(|| lower.strip_prefix("claude-sonnet-"))
+        .or_else(|| lower.strip_prefix("claude-haiku-"))?;
+
+    if let Some((major, minor)) = rest.split_once('.') {
+        return Some((major.parse().ok()?, minor.parse().ok()?));
+    }
+
+    let mut parts = rest.split('-');
+    let major = parts.next()?;
+    if !is_short_numeric_version_part(major) {
+        return None;
+    }
+    let minor = parts
+        .next()
+        .filter(|part| is_short_numeric_version_part(part))
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    Some((major.parse().ok()?, minor))
+}
+
 fn is_large_context_claude_model(model: &str) -> bool {
+    let Some((major, minor)) = parse_claude_family_version(model) else {
+        return false;
+    };
     let lower = model.to_ascii_lowercase();
     if !(lower.starts_with("claude-opus-") || lower.starts_with("claude-sonnet-")) {
         return false;
     }
-
-    let Some((before_minor, minor)) = lower.rsplit_once('.') else {
-        return false;
-    };
-    let Some((_, major)) = before_minor.rsplit_once('-') else {
-        return false;
-    };
-
-    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
-        return false;
-    };
-
     major > 4 || (major == 4 && minor >= 6)
 }
 
@@ -435,14 +455,20 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
+    let root_conversation_id = if conversation_id.starts_with("sess_") {
+        conversation_id.clone()
+    } else {
+        format!("sess_{conversation_id}")
+    };
     let conversation_state = ConversationState::new(conversation_id)
+        .with_root_conversation_id(root_conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
 
-    // 14. 根级字段：与官方 Kiro 1.0.138+ GPT 抓包对齐
+    // 14. 根级字段：与官方 Kiro 1.0.437 GPT / Claude 抓包对齐
     // - agentMode: vibe
     // - additionalModelRequestFields.reasoning.effort: GPT 必需
     let agent_mode = Some("vibe".to_string());
@@ -462,18 +488,72 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
 /// 构建官方 Kiro 根级 additionalModelRequestFields
 ///
-/// 新版 Kiro（1.0.138+）抓包差异：
-/// - GPT-5.6-luna: `{"reasoning":{"effort":"high"}}`
-/// - Claude Opus 4.8: `{"output_config":{"effort":"medium"}}`
-/// Claude Code adaptive 的 output_config.effort 会映射到对应字段。
+/// 官方 1.0.437 ListAvailableModels + GenerateAssistantResponse 抓包：
+/// - GPT-5.6：`{"reasoning":{"effort":"none|low|medium|high|xhigh|max"}}`，默认 `high`
+/// - Claude Opus/Sonnet 4.6+ / 5：`{"output_config":{"effort":"low|medium|high|xhigh|max"}}`
+///   - 4.6 无 `xhigh`；4.7 默认 `xhigh`；其余默认 `high`
+/// - Claude 4.5 / Haiku / Sonnet 4：不发送
+/// 官方 IDE 把 UI effortLevel 原样写入 schema path，不做数值换算。
 fn supports_additional_model_request_fields(model_id: &str) -> bool {
     if is_gpt_upstream_model(model_id) {
         return true;
     }
     let lower = model_id.to_ascii_lowercase();
-    // 官方/实测：Haiku 返回 "additionalModelRequestFields is not supported for this model"
-    // 仅 Sonnet / Opus 走 output_config.effort；GPT 走 reasoning.effort。
-    lower.starts_with("claude-sonnet-") || lower.starts_with("claude-opus-")
+    if !(lower.starts_with("claude-sonnet-") || lower.starts_with("claude-opus-")) {
+        return false;
+    }
+    parse_claude_family_version(model_id)
+        .is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 6))
+}
+
+const GPT_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+const CLAUDE_46_EFFORTS: &[&str] = &["low", "medium", "high", "max"];
+const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+fn allowed_efforts(model_id: &str) -> &'static [&'static str] {
+    if is_gpt_upstream_model(model_id) {
+        return GPT_EFFORTS;
+    }
+    match parse_claude_family_version(model_id) {
+        Some((4, 6)) => CLAUDE_46_EFFORTS,
+        _ => CLAUDE_EFFORTS,
+    }
+}
+
+fn default_effort_for_model(model_id: &str) -> &'static str {
+    if is_gpt_upstream_model(model_id) {
+        return "high";
+    }
+    match parse_claude_family_version(model_id) {
+        Some((4, 7)) => "xhigh",
+        _ => "high",
+    }
+}
+
+fn normalize_effort_token(raw: &str) -> Option<&'static str> {
+    let compact = raw.trim().to_ascii_lowercase().replace('_', "-");
+    match compact.as_str() {
+        "none" | "off" | "disabled" | "minimal" => Some("none"),
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "x-high" | "extra-high" | "extra" => Some("xhigh"),
+        "max" | "maximum" => Some("max"),
+        _ => None,
+    }
+}
+
+fn clamp_effort(effort: &str, allowed: &[&str], default: &str) -> String {
+    if allowed.contains(&effort) {
+        return effort.to_string();
+    }
+    if effort == "none" && allowed.contains(&"low") {
+        return "low".to_string();
+    }
+    if effort == "xhigh" && allowed.contains(&"max") {
+        return "max".to_string();
+    }
+    default.to_string()
 }
 
 fn build_additional_model_request_fields(
@@ -484,11 +564,7 @@ fn build_additional_model_request_fields(
         return None;
     }
 
-    let effort = resolve_effort(req, if is_gpt_upstream_model(model_id) {
-        "high"
-    } else {
-        "medium"
-    });
+    let effort = resolve_effort(req, model_id);
 
     if is_gpt_upstream_model(model_id) {
         return Some(serde_json::json!({
@@ -498,7 +574,6 @@ fn build_additional_model_request_fields(
         }));
     }
 
-    // Claude Sonnet / Opus（含 4.8）：官方 1.0.138 固定带 output_config.effort。
     Some(serde_json::json!({
         "output_config": {
             "effort": effort
@@ -506,30 +581,33 @@ fn build_additional_model_request_fields(
     }))
 }
 
-fn resolve_effort(req: &MessagesRequest, default: &str) -> String {
-    req.output_config
+fn resolve_effort(req: &MessagesRequest, model_id: &str) -> String {
+    let default = default_effort_for_model(model_id);
+    let allowed = allowed_efforts(model_id);
+    let requested = req
+        .output_config
         .as_ref()
         .map(|c| c.effort.as_str())
         .filter(|e| !e.is_empty())
-        .map(|e| e.to_string())
+        .and_then(normalize_effort_token)
         .or_else(|| {
             req.thinking.as_ref().and_then(|t| {
-                if t.thinking_type == "adaptive" {
-                    Some(
-                        req.output_config
-                            .as_ref()
-                            .map(|c| c.effort.clone())
-                            .filter(|e| !e.is_empty())
-                            .unwrap_or_else(|| default.to_string()),
-                    )
+                if t.thinking_type == "disabled" {
+                    Some(if is_gpt_upstream_model(model_id) {
+                        "none"
+                    } else {
+                        "low"
+                    })
                 } else if t.is_enabled() {
-                    Some(default.to_string())
+                    Some(default)
                 } else {
                     None
                 }
             })
         })
-        .unwrap_or_else(|| default.to_string())
+        .unwrap_or(default);
+
+    clamp_effort(requested, allowed, default)
 }
 
 /// 确定聊天触发类型
@@ -1288,6 +1366,13 @@ mod tests {
             map_model("claude-opus-4.7"),
             Some("claude-opus-4.7".to_string())
         );
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4.5"), 200_000);
     }
 
     #[test]
@@ -2404,6 +2489,148 @@ mod tests {
         assert!(
             result.additional_model_request_fields.is_none(),
             "haiku must not send additionalModelRequestFields"
+        );
+    }
+
+    fn sample_messages_request(model: &str, effort: Option<&str>) -> super::super::types::MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_gpt_reasoning_effort_passthrough_and_aliases() {
+        let none = convert_request(&sample_messages_request("gpt-5.6-luna", Some("none")))
+            .expect("convert");
+        assert_eq!(
+            none.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "none"
+        );
+
+        let max = convert_request(&sample_messages_request("gpt-5.6-sol", Some("max"))).expect("convert");
+        assert_eq!(
+            max.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "max"
+        );
+
+        let xhigh = convert_request(&sample_messages_request("gpt-5.6-luna", Some("x-high")))
+            .expect("convert");
+        assert_eq!(
+            xhigh.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "xhigh"
+        );
+
+        let default = convert_request(&sample_messages_request("gpt-5.6-luna", None)).expect("convert");
+        assert_eq!(
+            default.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "high"
+        );
+        assert!(default
+            .conversation_state
+            .root_conversation_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("sess_")));
+    }
+
+    #[test]
+    fn test_claude_opus_5_output_config_effort() {
+        let max = convert_request(&sample_messages_request("claude-opus-5", Some("max")))
+            .expect("convert");
+        let fields = max.additional_model_request_fields.expect("opus 5 sends fields");
+        assert_eq!(fields["output_config"]["effort"], "max");
+        assert!(fields.get("reasoning").is_none());
+        assert_eq!(
+            max.conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-5"
+        );
+
+        let low = convert_request(&sample_messages_request("claude-opus-5", Some("low")))
+            .expect("convert");
+        assert_eq!(
+            low.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn test_claude_45_omits_additional_model_request_fields() {
+        let result = convert_request(&sample_messages_request(
+            "claude-sonnet-4-5",
+            Some("high"),
+        ))
+        .expect("convert");
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "Claude 4.5 has no additionalModelRequestFieldsSchema"
+        );
+    }
+
+    #[test]
+    fn test_claude_46_clamps_xhigh_to_max() {
+        let result = convert_request(&sample_messages_request(
+            "claude-sonnet-4-6",
+            Some("xhigh"),
+        ))
+        .expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "max"
+        );
+    }
+
+    #[test]
+    fn test_claude_47_default_effort_is_xhigh() {
+        let result = convert_request(&sample_messages_request("claude-opus-4-7", None))
+            .expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn test_gpt_disabled_thinking_maps_to_none() {
+        use super::super::types::{Message as AnthropicMessage, MessagesRequest, Thinking};
+        let req = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["reasoning"]["effort"],
+            "none"
         );
     }
 

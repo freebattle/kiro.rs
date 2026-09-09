@@ -3,10 +3,10 @@
 //! 统一维护 runtime / management 相关的 SDK 版本和 UA 格式，
 //! 协议指纹（kiroVersion / systemVersion / nodeVersion）为程序内常量。
 
-use crate::model::config::{KIRO_VERSION, NODE_VERSION, SYSTEM_VERSION};
+use crate::model::config::{KAS_VERSION, KIRO_VERSION, NODE_VERSION, SYSTEM_VERSION};
 
 pub const MANAGEMENT_SDK_VERSION: &str = "1.0.0";
-/// Kiro IDE 1.0.138+ runtime 使用 aws-sdk-js/1.0.0 + api/kiroruntime
+/// Kiro IDE 1.0.437+ runtime 使用 aws-sdk-js/1.0.0 + api/kiroruntime + KAS
 pub const RUNTIME_STREAMING_SDK_VERSION: &str = "1.0.0";
 
 /// Kiro CLI / Amazon Q for CLI（抓包 2026-07-14，kiro-cli 2.12.1）
@@ -19,15 +19,16 @@ fn kiro_ide_label(machine_id: &str) -> String {
     format!("KiroIDE-{}-{}", KIRO_VERSION, machine_id)
 }
 
-fn build_x_amz_user_agent(sdk_version: &str, machine_id: &str) -> String {
-    format!(
-        "aws-sdk-js/{} {}",
-        sdk_version,
-        kiro_ide_label(machine_id)
-    )
+/// Runtime / Control Plane 抓包带 `-KAS/{version}`；getUsageLimits 等 management runtime 不带。
+fn kiro_ide_kas_label(machine_id: &str) -> String {
+    format!("KiroIDE-{}-{}-KAS/{}", KIRO_VERSION, machine_id, KAS_VERSION)
 }
 
-fn build_user_agent(sdk_version: &str, machine_id: &str, api_name: &str, metrics: &str) -> String {
+fn build_x_amz_user_agent(sdk_version: &str, label: &str) -> String {
+    format!("aws-sdk-js/{} {}", sdk_version, label)
+}
+
+fn build_user_agent(sdk_version: &str, label: &str, api_name: &str, metrics: &str) -> String {
     format!(
         "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/{}#{} {} {}",
         sdk_version,
@@ -36,44 +37,47 @@ fn build_user_agent(sdk_version: &str, machine_id: &str, api_name: &str, metrics
         api_name,
         sdk_version,
         metrics,
-        kiro_ide_label(machine_id)
+        label
     )
 }
 
 pub fn runtime_streaming_x_amz_user_agent(machine_id: &str) -> String {
-    build_x_amz_user_agent(RUNTIME_STREAMING_SDK_VERSION, machine_id)
+    build_x_amz_user_agent(
+        RUNTIME_STREAMING_SDK_VERSION,
+        &kiro_ide_kas_label(machine_id),
+    )
 }
 
 pub fn runtime_streaming_user_agent(machine_id: &str) -> String {
     build_user_agent(
         RUNTIME_STREAMING_SDK_VERSION,
-        machine_id,
+        &kiro_ide_kas_label(machine_id),
         "kiroruntime",
         "m/N",
     )
 }
 
 pub fn management_runtime_x_amz_user_agent(machine_id: &str) -> String {
-    build_x_amz_user_agent(MANAGEMENT_SDK_VERSION, machine_id)
+    build_x_amz_user_agent(MANAGEMENT_SDK_VERSION, &kiro_ide_label(machine_id))
 }
 
 pub fn management_runtime_user_agent(machine_id: &str) -> String {
     build_user_agent(
         MANAGEMENT_SDK_VERSION,
-        machine_id,
+        &kiro_ide_label(machine_id),
         "codewhispererruntime",
         "m/N,E",
     )
 }
 
 pub fn management_control_plane_x_amz_user_agent(machine_id: &str) -> String {
-    build_x_amz_user_agent(MANAGEMENT_SDK_VERSION, machine_id)
+    build_x_amz_user_agent(MANAGEMENT_SDK_VERSION, &kiro_ide_kas_label(machine_id))
 }
 
 pub fn management_control_plane_user_agent(machine_id: &str) -> String {
     build_user_agent(
         MANAGEMENT_SDK_VERSION,
-        machine_id,
+        &kiro_ide_kas_label(machine_id),
         "kirocontrolplanebearer",
         "m/N,E",
     )
@@ -123,8 +127,8 @@ mod tests {
         assert_eq!(
             ua,
             format!(
-                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N KiroIDE-{}-machine123",
-                SYSTEM_VERSION, NODE_VERSION, KIRO_VERSION
+                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N KiroIDE-{}-machine123-KAS/{}",
+                SYSTEM_VERSION, NODE_VERSION, KIRO_VERSION, KAS_VERSION
             )
         );
     }
@@ -134,8 +138,21 @@ mod tests {
         let ua = management_control_plane_x_amz_user_agent("machine123");
         assert_eq!(
             ua,
+            format!(
+                "aws-sdk-js/1.0.0 KiroIDE-{}-machine123-KAS/{}",
+                KIRO_VERSION, KAS_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn test_management_runtime_x_amz_user_agent_omits_kas() {
+        let ua = management_runtime_x_amz_user_agent("machine123");
+        assert_eq!(
+            ua,
             format!("aws-sdk-js/1.0.0 KiroIDE-{}-machine123", KIRO_VERSION)
         );
+        assert!(!ua.contains("KAS/"));
     }
 
     #[test]

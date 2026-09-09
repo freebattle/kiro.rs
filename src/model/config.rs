@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// 协议指纹：Kiro IDE 版本（User-Agent / 协议对齐）
-pub const KIRO_VERSION: &str = "1.0.138";
+pub const KIRO_VERSION: &str = "1.0.437";
+
+/// 协议指纹：Runtime / Control Plane User-Agent 中的 KAS 段（官方 1.0.437）
+pub const KAS_VERSION: &str = "0.54.0";
 
 /// 协议指纹：IDE User-Agent 中的系统标识
-pub const SYSTEM_VERSION: &str = "darwin#24.6.0";
+pub const SYSTEM_VERSION: &str = "darwin#25.5.0";
 
 /// 协议指纹：IDE User-Agent 中的 Node 版本
 pub const NODE_VERSION: &str = "22.22.0";

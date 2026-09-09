@@ -139,6 +139,7 @@ fn transform_cli_api_body(request_body: &str, profile_arn: &Option<String>) -> S
             .and_then(|v| v.as_object_mut())
         {
             cs.remove("agentContinuationId");
+            cs.remove("rootConversationId");
             rewrite_conversation_state_for_cli(cs);
         }
     }
@@ -242,6 +243,7 @@ mod tests {
                 "agentTaskType": "vibe",
                 "chatTriggerType": "MANUAL",
                 "conversationId": "c1",
+                "rootConversationId": "sess_c1",
                 "currentMessage": {
                     "userInputMessage": {
                         "content": "hi",
@@ -305,6 +307,9 @@ mod tests {
         );
         assert!(json["conversationState"]
             .get("agentContinuationId")
+            .is_none());
+        assert!(json["conversationState"]
+            .get("rootConversationId")
             .is_none());
         assert_eq!(json["conversationState"]["agentTaskType"], "vibe");
         assert_eq!(

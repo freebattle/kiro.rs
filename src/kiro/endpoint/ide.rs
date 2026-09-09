@@ -1,6 +1,6 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 1.0.138+ 客户端当前使用的 Kiro Runtime 端点：
+//! 对应 Kiro IDE 1.0.437 客户端当前使用的 Kiro Runtime 端点：
 //! - API: `https://runtime.{api_region}.kiro.dev` + `x-amz-target: KiroRuntimeService.GenerateAssistantResponse`
 //! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
@@ -41,7 +41,7 @@ impl IdeEndpoint {
         user_agent::runtime_streaming_user_agent(ctx.machine_id)
     }
 
-    /// 官方 Kiro 1.0.138 使用 `TokenType` 头：
+    /// 官方 Kiro 1.0.437 使用 `TokenType` 头：
     /// - SSO 登录: SSO_OIDC
     /// - API Key: API_KEY
     fn token_type(&self, ctx: &RequestContext<'_>) -> &'static str {
@@ -65,7 +65,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        // 1.0.138+：根路径 + x-amz-target，不再走 /generateAssistantResponse
+        // 1.0.138+ / 1.0.437：根路径 + x-amz-target，不再走 /generateAssistantResponse
         format!("https://runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
@@ -78,16 +78,18 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        // agentMode 已在请求体根字段发送，官方 1.0.138 不再带 x-amzn-kiro-agent-mode 头
+        // agentMode 已在请求体根字段发送，官方 1.0.138+ 不再带 x-amzn-kiro-agent-mode 头
         req.header(
             "x-amz-target",
             "KiroRuntimeService.GenerateAssistantResponse",
         )
+        .header("x-amzn-kiro-client-attribution", "kiro-ide")
         .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
         .header("user-agent", self.user_agent(ctx))
         .header("host", self.host(ctx))
         .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=3")
+        .header("x-kiro-attempt", "1;max=3")
         .header("TokenType", self.token_type(ctx))
         .header("Authorization", format!("Bearer {}", ctx.token))
     }

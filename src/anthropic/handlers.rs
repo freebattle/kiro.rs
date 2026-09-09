@@ -197,6 +197,24 @@ fn fallback_models() -> Vec<Model> {
             max_tokens: 128000,
         },
         Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1784851200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1784851200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1780012800,
@@ -323,7 +341,7 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    // agentMode / additionalModelRequestFields 对齐官方 Kiro 1.0.138+ GPT 抓包
+    // agentMode / additionalModelRequestFields 对齐官方 Kiro 1.0.437 GPT / Claude 抓包
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,

@@ -35,7 +35,7 @@ pub struct KiroRequest {
     /// Profile ARN（可选；IDE 端点会在发送前注入）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
-    /// Agent 模式（官方 Kiro 1.0.138+ 根字段，与 conversationState.agentTaskType 对齐）
+    /// Agent 模式（官方 Kiro 1.0.437 根字段，与 conversationState.agentTaskType 对齐）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_mode: Option<String>,
     /// 额外模型请求字段（GPT 5.6 需要 reasoning.effort）
