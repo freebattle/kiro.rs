@@ -22,7 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, claude_upstream_to_legacy_id, convert_request};
+use super::converter::{
+    ConversionError, claude_upstream_to_legacy_id, convert_request, exceeds_context_window,
+};
 use super::middleware::{AppState, CallerIdentity};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -86,8 +88,11 @@ fn map_provider_error(err: Error) -> Response {
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    // 1. 尝试读缓存
-    if let Some(remote_models) = state.models_cache.get().await {
+    if let Some(remote_models) = state
+        .models_cache
+        .ensure_models(state.kiro_provider.as_deref())
+        .await
+    {
         let models = filter_and_convert(&remote_models, state.include_open_source_models);
         return Json(ModelsResponse {
             object: "list".to_string(),
@@ -95,32 +100,41 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
         });
     }
 
-    // 2. 缓存未命中/过期，尝试远程拉取
-    if let Some(provider) = &state.kiro_provider {
-        match provider.fetch_available_models().await {
-            Ok(resp) => {
-                tracing::info!(
-                    "ListAvailableModels 成功，获取到 {} 个模型",
-                    resp.models.len()
-                );
-                state.models_cache.set(resp.models.clone()).await;
-                let models = filter_and_convert(&resp.models, state.include_open_source_models);
-                return Json(ModelsResponse {
-                    object: "list".to_string(),
-                    data: models,
-                });
-            }
-            Err(e) => {
-                tracing::warn!("ListAvailableModels 失败，使用兜底列表: {}", e);
-            }
-        }
-    }
-
-    // 3. 兜底：硬编码列表
     Json(ModelsResponse {
         object: "list".to_string(),
         data: fallback_models(),
     })
+}
+
+fn context_overflow_error(estimated: i32, max_input: i32) -> Response {
+    tracing::warn!(
+        estimated_input_tokens = estimated,
+        max_input_tokens = max_input,
+        "请求超过模型上下文窗口，拒绝转发上游"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            format!(
+                "Context window is full. Reduce conversation history, system prompt, or tools. (estimated {estimated} tokens, limit {max_input})"
+            ),
+        )),
+    )
+        .into_response()
+}
+
+async fn reject_if_over_context(
+    state: &AppState,
+    model: &str,
+    input_tokens: i32,
+) -> Option<Response> {
+    let max_input = state
+        .models_cache
+        .resolve_max_input_tokens(model, state.kiro_provider.as_deref())
+        .await;
+    exceeds_context_window(input_tokens, max_input)
+        .then(|| context_overflow_error(input_tokens, max_input))
 }
 
 /// 判断模型 ID 是否为 Claude 系列（含 "auto" 通用模型）
@@ -316,6 +330,10 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
+        if let Some(resp) = reject_if_over_context(&state, &payload.model, input_tokens).await {
+            return resp;
+        }
+
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
@@ -391,6 +409,10 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
+
+    if let Some(resp) = reject_if_over_context(&state, &payload.model, input_tokens).await {
+        return resp;
+    }
 
     let cache_read_tokens = state
         .prompt_cache
@@ -904,10 +926,7 @@ async fn handle_non_stream_request(
     }
 
     if quota_exhausted {
-        tracing::warn!(
-            "非流式响应额度已用尽，禁用凭据 #{} 并切换",
-            credential_id
-        );
+        tracing::warn!("非流式响应额度已用尽，禁用凭据 #{} 并切换", credential_id);
         provider.report_quota_exhausted(credential_id);
         let duration_ms = start_time.elapsed().as_millis() as u64;
         let model_owned = model.to_string();
@@ -928,9 +947,7 @@ async fn handle_non_stream_request(
                 thinking_effort,
             });
         });
-        return map_provider_error(anyhow::anyhow!(
-            "额度已用尽（MONTHLY_REQUEST_COUNT）"
-        ));
+        return map_provider_error(anyhow::anyhow!("额度已用尽（MONTHLY_REQUEST_COUNT）"));
     }
 
     // 确定 stop_reason

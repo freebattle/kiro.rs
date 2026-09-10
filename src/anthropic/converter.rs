@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::kiro::model::available_models::RemoteModelInfo;
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, ReasoningContent, UserInputMessage,
@@ -204,6 +205,7 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
+/// 仅作 ListAvailableModels 不可用时的兜底：
 /// - Claude Opus 4.6+ / Sonnet 4.6+：1M（Kiro 2026-03-24 升级）
 /// - GPT 5.6 系列：272k（ListAvailableModels / 官方 HAR）
 /// - 其余：200k
@@ -213,6 +215,32 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped) if is_large_context_claude_model(&mapped) => 1_000_000,
         _ => 200_000,
     }
+}
+
+/// 从上游模型列表解析 `maxInputTokens`。
+///
+/// 客户端别名（`gpt-5.6`、`claude-opus-4-8`）会先 `map_model` 再匹配。
+pub fn lookup_max_input_tokens(model: &str, models: &[RemoteModelInfo]) -> Option<i32> {
+    let mapped = map_model(model).unwrap_or_else(|| model.to_string());
+    models.iter().find_map(|m| {
+        if m.model_id != mapped && m.model_id != model {
+            return None;
+        }
+        let tokens = m.token_limits.as_ref()?.max_input_tokens?;
+        (tokens > 0).then_some(tokens as i32)
+    })
+}
+
+/// 优先用上游 `maxInputTokens`，缺失时回退硬编码窗口。
+pub fn resolve_max_input_tokens(model: &str, models: Option<&[RemoteModelInfo]>) -> i32 {
+    models
+        .and_then(|list| lookup_max_input_tokens(model, list))
+        .unwrap_or_else(|| get_context_window_size(model))
+}
+
+/// 估算输入已达到或超过模型上下文窗口。
+pub fn exceeds_context_window(estimated_input: i32, max_input: i32) -> bool {
+    max_input > 0 && estimated_input >= max_input
 }
 
 /// 解析 Claude 家族版本 `(major, minor)`。
@@ -1223,7 +1251,8 @@ fn convert_assistant_message(
         };
         let sig = reasoning_signature.unwrap_or_default();
         if !sig.is_empty() {
-            assistant = assistant.with_reasoning_content(ReasoningContent::new(reasoning_text, sig));
+            assistant =
+                assistant.with_reasoning_content(ReasoningContent::new(reasoning_text, sig));
         }
     }
 
@@ -1319,25 +1348,13 @@ mod tests {
 
     #[test]
     fn test_map_model_gpt_5_6() {
-        assert_eq!(
-            map_model("gpt-5.6-luna"),
-            Some("gpt-5.6-luna".to_string())
-        );
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
         assert_eq!(map_model("gpt-5.6"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(
-            map_model("gpt-5-6-luna"),
-            Some("gpt-5.6-luna".to_string())
-        );
+        assert_eq!(map_model("gpt-5-6-luna"), Some("gpt-5.6-luna".to_string()));
         assert_eq!(map_model("gpt-5-6"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(
-            map_model("GPT-5.6-LUNA"),
-            Some("gpt-5.6-luna".to_string())
-        );
+        assert_eq!(map_model("GPT-5.6-LUNA"), Some("gpt-5.6-luna".to_string()));
         assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(
-            map_model("gpt-5-6-sol"),
-            Some("gpt-5.6-sol".to_string())
-        );
+        assert_eq!(map_model("gpt-5-6-sol"), Some("gpt-5.6-sol".to_string()));
         assert_eq!(
             map_model("gpt-5.6-terra"),
             Some("gpt-5.6-terra".to_string())
@@ -1378,13 +1395,70 @@ mod tests {
             map_model("claude-opus-4.7"),
             Some("claude-opus-4.7".to_string())
         );
-        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
         assert_eq!(
             map_model("claude-sonnet-5"),
             Some("claude-sonnet-5".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4.5"), 200_000);
+    }
+
+    fn remote_model(id: &str, max_input: Option<i64>) -> RemoteModelInfo {
+        let mut value = serde_json::json!({ "modelId": id });
+        if let Some(tokens) = max_input {
+            value["tokenLimits"] = serde_json::json!({ "maxInputTokens": tokens });
+        }
+        serde_json::from_value(value).expect("remote model fixture")
+    }
+
+    #[test]
+    fn test_lookup_max_input_tokens_maps_gpt_alias() {
+        let models = vec![remote_model("gpt-5.6-luna", Some(272_000))];
+        assert_eq!(lookup_max_input_tokens("gpt-5.6", &models), Some(272_000));
+        assert_eq!(
+            lookup_max_input_tokens("gpt-5.6-luna", &models),
+            Some(272_000)
+        );
+    }
+
+    #[test]
+    fn test_lookup_max_input_tokens_maps_claude_legacy_id() {
+        let models = vec![remote_model("claude-opus-4.8", Some(1_000_000))];
+        assert_eq!(
+            lookup_max_input_tokens("claude-opus-4-8", &models),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_resolve_max_input_tokens_prefers_upstream_and_falls_back() {
+        let models = vec![remote_model("gpt-5.6-luna", Some(300_000))];
+        assert_eq!(resolve_max_input_tokens("gpt-5.6", Some(&models)), 300_000);
+        assert_eq!(
+            resolve_max_input_tokens("gpt-5.6-luna", None),
+            get_context_window_size("gpt-5.6-luna")
+        );
+        assert_eq!(
+            resolve_max_input_tokens("gpt-5.6-sol", Some(&models)),
+            get_context_window_size("gpt-5.6-sol")
+        );
+        assert_eq!(
+            resolve_max_input_tokens("gpt-5.6-luna", Some(&[remote_model("gpt-5.6-luna", None)])),
+            get_context_window_size("gpt-5.6-luna")
+        );
+    }
+
+    #[test]
+    fn test_exceeds_context_window() {
+        assert!(exceeds_context_window(272_000, 272_000));
+        assert!(exceeds_context_window(272_001, 272_000));
+        assert!(!exceeds_context_window(271_999, 272_000));
+        assert!(!exceeds_context_window(100, 0));
+        assert!(!exceeds_context_window(100, -1));
     }
 
     #[test]
@@ -2006,11 +2080,10 @@ mod tests {
 
         // GPT 会跨轮复用 call_2：历史中 call_2 已配对，最新一轮又用 call_2，当前 result 必须保留
         let mut assistant_msg1 = AssistantMessage::new("先读 settings");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new(
-            "call_2",
-            "read_file",
-        )
-        .with_input(serde_json::json!({"path": "settings.json"}))]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
+            ToolUseEntry::new("call_2", "read_file")
+                .with_input(serde_json::json!({"path": "settings.json"})),
+        ]);
 
         let mut user_result1 = UserMessage::new("", "gpt-5.6-luna");
         user_result1 = user_result1.with_context(
@@ -2019,11 +2092,10 @@ mod tests {
         );
 
         let mut assistant_msg2 = AssistantMessage::new("改读 workspace 文件");
-        assistant_msg2 = assistant_msg2.with_tool_uses(vec![ToolUseEntry::new(
-            "call_2",
-            "read_file",
-        )
-        .with_input(serde_json::json!({"path": "src/beautifier.js"}))]);
+        assistant_msg2 = assistant_msg2.with_tool_uses(vec![
+            ToolUseEntry::new("call_2", "read_file")
+                .with_input(serde_json::json!({"path": "src/beautifier.js"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new("测试工具", "gpt-5.6-luna")),
@@ -2063,9 +2135,8 @@ mod tests {
             ]),
         };
 
-        let result =
-            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
-                .expect("应该成功转换");
+        let result = convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+            .expect("应该成功转换");
 
         assert_eq!(
             result.assistant_response_message.content, "",
@@ -2095,9 +2166,8 @@ mod tests {
             ]),
         };
 
-        let result =
-            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
-                .expect("应该成功转换");
+        let result = convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+            .expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -2210,9 +2280,8 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result =
-            merge_assistant_messages(&messages, "claude-sonnet-4.5", &mut HashMap::new())
-                .expect("合并应成功");
+        let result = merge_assistant_messages(&messages, "claude-sonnet-4.5", &mut HashMap::new())
+            .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
@@ -2251,8 +2320,8 @@ mod tests {
             ]),
         };
 
-        let result =
-            convert_assistant_message(&msg, "gpt-5.6-luna", &mut HashMap::new()).expect("转换应成功");
+        let result = convert_assistant_message(&msg, "gpt-5.6-luna", &mut HashMap::new())
+            .expect("转换应成功");
         let am = result.assistant_response_message;
 
         // GPT 场景：thinking 不应嵌进 content，而应进入 reasoningContent
@@ -2271,7 +2340,9 @@ mod tests {
 
     #[test]
     fn test_convert_request_gpt_includes_reasoning_effort_fields() {
-        use super::super::types::{Message as AnthropicMessage, MessagesRequest, Thinking, OutputConfig};
+        use super::super::types::{
+            Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking,
+        };
 
         let req = MessagesRequest {
             model: "gpt-5.6".to_string(),
@@ -2404,9 +2475,8 @@ mod tests {
             ]),
         };
 
-        let result =
-            convert_assistant_message(&msg, "claude-opus-4.8", &mut HashMap::new())
-                .expect("转换应成功");
+        let result = convert_assistant_message(&msg, "claude-opus-4.8", &mut HashMap::new())
+            .expect("转换应成功");
         let am = result.assistant_response_message;
 
         assert_eq!(am.content, "done");
@@ -2433,9 +2503,8 @@ mod tests {
             ]),
         };
 
-        let result =
-            convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
-                .expect("转换应成功");
+        let result = convert_assistant_message(&msg, "claude-sonnet-4.5", &mut HashMap::new())
+            .expect("转换应成功");
         let am = result.assistant_response_message;
 
         assert!(am.content.contains("<thinking>plan</thinking>"));
@@ -2483,7 +2552,6 @@ mod tests {
         );
     }
 
-    
     #[test]
     fn test_haiku_omits_additional_model_request_fields() {
         use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
@@ -2513,7 +2581,10 @@ mod tests {
         );
     }
 
-    fn sample_messages_request(model: &str, effort: Option<&str>) -> super::super::types::MessagesRequest {
+    fn sample_messages_request(
+        model: &str,
+        effort: Option<&str>,
+    ) -> super::super::types::MessagesRequest {
         use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig};
         MessagesRequest {
             model: model.to_string(),
@@ -2544,7 +2615,8 @@ mod tests {
             "none"
         );
 
-        let max = convert_request(&sample_messages_request("gpt-5.6-sol", Some("max"))).expect("convert");
+        let max =
+            convert_request(&sample_messages_request("gpt-5.6-sol", Some("max"))).expect("convert");
         assert_eq!(
             max.additional_model_request_fields.unwrap()["reasoning"]["effort"],
             "max"
@@ -2557,23 +2629,28 @@ mod tests {
             "xhigh"
         );
 
-        let default = convert_request(&sample_messages_request("gpt-5.6-luna", None)).expect("convert");
+        let default =
+            convert_request(&sample_messages_request("gpt-5.6-luna", None)).expect("convert");
         assert_eq!(
             default.additional_model_request_fields.unwrap()["reasoning"]["effort"],
             "high"
         );
-        assert!(default
-            .conversation_state
-            .root_conversation_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("sess_")));
+        assert!(
+            default
+                .conversation_state
+                .root_conversation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("sess_"))
+        );
     }
 
     #[test]
     fn test_claude_opus_5_output_config_effort() {
         let max = convert_request(&sample_messages_request("claude-opus-5", Some("max")))
             .expect("convert");
-        let fields = max.additional_model_request_fields.expect("opus 5 sends fields");
+        let fields = max
+            .additional_model_request_fields
+            .expect("opus 5 sends fields");
         assert_eq!(fields["output_config"]["effort"], "max");
         assert!(fields.get("reasoning").is_none());
         assert_eq!(
@@ -2594,11 +2671,8 @@ mod tests {
 
     #[test]
     fn test_claude_45_omits_additional_model_request_fields() {
-        let result = convert_request(&sample_messages_request(
-            "claude-sonnet-4-5",
-            Some("high"),
-        ))
-        .expect("convert");
+        let result = convert_request(&sample_messages_request("claude-sonnet-4-5", Some("high")))
+            .expect("convert");
         assert!(
             result.additional_model_request_fields.is_none(),
             "Claude 4.5 has no additionalModelRequestFieldsSchema"
@@ -2607,11 +2681,8 @@ mod tests {
 
     #[test]
     fn test_claude_46_clamps_xhigh_to_max() {
-        let result = convert_request(&sample_messages_request(
-            "claude-sonnet-4-6",
-            Some("xhigh"),
-        ))
-        .expect("convert");
+        let result = convert_request(&sample_messages_request("claude-sonnet-4-6", Some("xhigh")))
+            .expect("convert");
         assert_eq!(
             result.additional_model_request_fields.unwrap()["output_config"]["effort"],
             "max"
@@ -2620,8 +2691,8 @@ mod tests {
 
     #[test]
     fn test_claude_47_default_effort_is_xhigh() {
-        let result = convert_request(&sample_messages_request("claude-opus-4-7", None))
-            .expect("convert");
+        let result =
+            convert_request(&sample_messages_request("claude-opus-4-7", None)).expect("convert");
         assert_eq!(
             result.additional_model_request_fields.unwrap()["output_config"]["effort"],
             "xhigh"
@@ -2659,7 +2730,9 @@ mod tests {
 
     #[test]
     fn test_gpt_reads_reasoning_effort_over_adaptive_thinking() {
-        use super::super::types::{Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking};
+        use super::super::types::{
+            Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking,
+        };
         let req = MessagesRequest {
             model: "gpt-5.6-luna".to_string(),
             max_tokens: 1024,

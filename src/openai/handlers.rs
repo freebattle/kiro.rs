@@ -8,12 +8,12 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Json, Response,
+        sse::{Event as SseEvent, KeepAlive, Sse},
     },
 };
 use futures::stream::{self, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -31,9 +31,7 @@ use super::converter::{
 };
 use super::history::expand_previous_response_history;
 use super::input::parse_responses_input;
-use super::store::{
-    generate_output_item_id, generate_response_id, ResponseStore, StoreError,
-};
+use super::store::{ResponseStore, StoreError, generate_output_item_id, generate_response_id};
 use super::types::{
     OpenAIErrorResponse, ResponseContentPart, ResponseOutputItem, ResponsesObject,
     ResponsesRequest, ResponsesUsage,
@@ -110,7 +108,11 @@ pub async fn post_responses(
     let input_messages = match parse_responses_input(&payload.input) {
         Ok(m) => m,
         Err(e) => {
-            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            );
         }
     };
 
@@ -135,10 +137,9 @@ pub async fn post_responses(
         Ok(r) => r,
         Err(e) => {
             let (status, msg) = match &e {
-                ConversionError::UnsupportedModel(m) => (
-                    StatusCode::BAD_REQUEST,
-                    format!("model not supported: {m}"),
-                ),
+                ConversionError::UnsupportedModel(m) => {
+                    (StatusCode::BAD_REQUEST, format!("model not supported: {m}"))
+                }
                 ConversionError::EmptyMessages => {
                     (StatusCode::BAD_REQUEST, "messages empty".to_string())
                 }
@@ -179,6 +180,26 @@ pub async fn post_responses(
         anthropic_req.messages.clone(),
         anthropic_req.tools.clone(),
     ) as i32;
+
+    let max_input = state
+        .models_cache
+        .resolve_max_input_tokens(&payload.model, state.kiro_provider.as_deref())
+        .await;
+    if converter::exceeds_context_window(input_tokens, max_input) {
+        tracing::warn!(
+            model = %payload.model,
+            estimated_input_tokens = input_tokens,
+            max_input_tokens = max_input,
+            "请求超过模型上下文窗口，拒绝转发上游"
+        );
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "Context window is full. Reduce conversation history, system prompt, or tools. (estimated {input_tokens} tokens, limit {max_input})"
+            ),
+        );
+    }
 
     let session_fp = crate::prompt_cache::compute_session_fingerprint(
         None,
@@ -289,10 +310,7 @@ async fn handle_non_stream(
 
     let collected = collect_kiro_events(&body_bytes, &tool_name_map, model, input_tokens);
     if collected.quota_exhausted {
-        tracing::warn!(
-            "非流式响应额度已用尽，禁用凭据 #{} 并切换",
-            credential_id
-        );
+        tracing::warn!("非流式响应额度已用尽，禁用凭据 #{} 并切换", credential_id);
         provider.report_quota_exhausted(credential_id);
         log_failure(
             &request_log,
@@ -431,7 +449,9 @@ fn collect_kiro_events(
                         .or_else(|| tool_names.get(&tool_use.tool_use_id).cloned())
                         .unwrap_or_else(|| tool_use.name.clone());
                     // 避免重复
-                    if !tool_uses.iter().any(|t: &CollectedToolUse| t.id == tool_use.tool_use_id)
+                    if !tool_uses
+                        .iter()
+                        .any(|t: &CollectedToolUse| t.id == tool_use.tool_use_id)
                     {
                         tool_uses.push(CollectedToolUse {
                             id: tool_use.tool_use_id,
@@ -763,9 +783,8 @@ async fn handle_stream(
 }
 
 struct StreamState {
-    body_stream: std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
-    >,
+    body_stream:
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     decoder: EventStreamDecoder,
     resp_id: String,
     model: String,
@@ -923,22 +942,20 @@ impl StreamState {
                                     ),
                             );
                             events.push(
-                                SseEvent::default()
-                                    .event("response.output_item.done")
-                                    .data(
-                                        json!({
-                                            "type":"response.output_item.done",
-                                            "output_index": idx,
-                                            "item":{
-                                                "id": item_id,
-                                                "type":"message",
-                                                "role":"assistant",
-                                                "status":"completed",
-                                                "content":[{"type":"output_text","text": text}]
-                                            }
-                                        })
-                                        .to_string(),
-                                    ),
+                                SseEvent::default().event("response.output_item.done").data(
+                                    json!({
+                                        "type":"response.output_item.done",
+                                        "output_index": idx,
+                                        "item":{
+                                            "id": item_id,
+                                            "type":"message",
+                                            "role":"assistant",
+                                            "status":"completed",
+                                            "content":[{"type":"output_text","text": text}]
+                                        }
+                                    })
+                                    .to_string(),
+                                ),
                             );
                             self.message_started = false;
                             self.output_index += 1;
@@ -1017,23 +1034,21 @@ impl StreamState {
                                     ),
                             );
                             events.push(
-                                SseEvent::default()
-                                    .event("response.output_item.done")
-                                    .data(
-                                        json!({
-                                            "type":"response.output_item.done",
-                                            "output_index": idx,
-                                            "item":{
-                                                "id": ctc_id,
-                                                "type":"custom_tool_call",
-                                                "status":"completed",
-                                                "call_id": tool_use.tool_use_id,
-                                                "name": original_name,
-                                                "input": freeform
-                                            }
-                                        })
-                                        .to_string(),
-                                    ),
+                                SseEvent::default().event("response.output_item.done").data(
+                                    json!({
+                                        "type":"response.output_item.done",
+                                        "output_index": idx,
+                                        "item":{
+                                            "id": ctc_id,
+                                            "type":"custom_tool_call",
+                                            "status":"completed",
+                                            "call_id": tool_use.tool_use_id,
+                                            "name": original_name,
+                                            "input": freeform
+                                        }
+                                    })
+                                    .to_string(),
+                                ),
                             );
                         } else {
                             let fc_id = generate_output_item_id("fc");
@@ -1070,31 +1085,28 @@ impl StreamState {
                                     ),
                             );
                             events.push(
-                                SseEvent::default()
-                                    .event("response.output_item.done")
-                                    .data(
-                                        json!({
-                                            "type":"response.output_item.done",
-                                            "output_index": idx,
-                                            "item":{
-                                                "id": fc_id,
-                                                "type":"function_call",
-                                                "status":"completed",
-                                                "call_id": tool_use.tool_use_id,
-                                                "name": original_name,
-                                                "arguments": args
-                                            }
-                                        })
-                                        .to_string(),
-                                    ),
+                                SseEvent::default().event("response.output_item.done").data(
+                                    json!({
+                                        "type":"response.output_item.done",
+                                        "output_index": idx,
+                                        "item":{
+                                            "id": fc_id,
+                                            "type":"function_call",
+                                            "status":"completed",
+                                            "call_id": tool_use.tool_use_id,
+                                            "name": original_name,
+                                            "arguments": args
+                                        }
+                                    })
+                                    .to_string(),
+                                ),
                             );
                         }
                         self.output_index += 1;
                     }
                 }
                 Event::ContextUsage(ctx) => {
-                    let window =
-                        crate::anthropic::converter::get_context_window_size(&self.model);
+                    let window = crate::anthropic::converter::get_context_window_size(&self.model);
                     self.context_input_tokens =
                         Some((ctx.context_usage_percentage * (window as f64) / 100.0) as i32);
                 }
@@ -1108,7 +1120,6 @@ impl StreamState {
             self.enqueue(events);
         }
     }
-
 
     fn finish_stream(&mut self) {
         // strip thinking tags from accumulated text for final object
@@ -1215,18 +1226,16 @@ impl StreamState {
         let mut public = resp_obj;
         public.stored_input = None;
         self.enqueue(vec![
-            SseEvent::default().event("response.completed").data(
-                json!({"type":"response.completed","response": public}).to_string(),
-            ),
+            SseEvent::default()
+                .event("response.completed")
+                .data(json!({"type":"response.completed","response": public}).to_string()),
             SseEvent::default().data("[DONE]"),
         ]);
     }
 }
 
 fn sse_json(event: &str, value: Value) -> Result<SseEvent, axum::Error> {
-    Ok(SseEvent::default()
-        .event(event)
-        .data(value.to_string()))
+    Ok(SseEvent::default().event(event).data(value.to_string()))
 }
 
 fn openai_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
@@ -1259,9 +1268,7 @@ fn resolve_thinking_effort(payload: &ResponsesRequest) -> Option<String> {
                 .filter(|effort| !effort.is_empty())
         })
         .map(str::to_string)
-        .or_else(|| {
-            converter::is_gpt_upstream_model(&payload.model).then(|| "high".to_string())
-        })
+        .or_else(|| converter::is_gpt_upstream_model(&payload.model).then(|| "high".to_string()))
 }
 
 fn log_failure(

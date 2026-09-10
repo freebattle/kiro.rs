@@ -63,6 +63,41 @@ impl ModelsCache {
         guard.models = models;
         guard.fetched_at = Some(Instant::now());
     }
+
+    /// 返回未过期的模型列表；缓存未命中时尝试远程拉取。
+    pub async fn ensure_models(
+        &self,
+        provider: Option<&KiroProvider>,
+    ) -> Option<Vec<RemoteModelInfo>> {
+        if let Some(models) = self.get().await {
+            return Some(models);
+        }
+        let provider = provider?;
+        match provider.fetch_available_models().await {
+            Ok(resp) => {
+                tracing::info!(
+                    "ListAvailableModels 成功，获取到 {} 个模型",
+                    resp.models.len()
+                );
+                self.set(resp.models.clone()).await;
+                Some(resp.models)
+            }
+            Err(e) => {
+                tracing::warn!("ListAvailableModels 失败: {}", e);
+                None
+            }
+        }
+    }
+
+    /// 解析模型上下文窗口：上游 `maxInputTokens`，否则硬编码兜底。
+    pub async fn resolve_max_input_tokens(
+        &self,
+        model: &str,
+        provider: Option<&KiroProvider>,
+    ) -> i32 {
+        let models = self.ensure_models(provider).await;
+        super::converter::resolve_max_input_tokens(model, models.as_deref())
+    }
 }
 
 /// 调用者身份（通过请求扩展传递）
@@ -97,10 +132,7 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(
-        api_key: impl Into<String>,
-        request_log: RequestLogStore,
-    ) -> Self {
+    pub fn new(api_key: impl Into<String>, request_log: RequestLogStore) -> Self {
         Self {
             api_key: api_key.into(),
             api_keys: Vec::new(),
@@ -190,4 +222,36 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_model(id: &str, max_input: i64) -> RemoteModelInfo {
+        serde_json::from_value(serde_json::json!({
+            "modelId": id,
+            "tokenLimits": { "maxInputTokens": max_input }
+        }))
+        .expect("remote model fixture")
+    }
+
+    #[tokio::test]
+    async fn resolve_max_input_tokens_uses_cache() {
+        let cache = ModelsCache::new();
+        cache.set(vec![remote_model("gpt-5.6-luna", 300_000)]).await;
+        assert_eq!(
+            cache.resolve_max_input_tokens("gpt-5.6", None).await,
+            300_000
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_max_input_tokens_falls_back_when_empty() {
+        let cache = ModelsCache::new();
+        assert_eq!(
+            cache.resolve_max_input_tokens("gpt-5.6-luna", None).await,
+            super::super::converter::get_context_window_size("gpt-5.6-luna")
+        );
+    }
 }
