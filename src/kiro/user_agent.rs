@@ -8,6 +8,8 @@ use crate::model::config::{KAS_VERSION, KIRO_VERSION, NODE_VERSION, SYSTEM_VERSI
 pub const MANAGEMENT_SDK_VERSION: &str = "1.0.0";
 /// Kiro IDE 1.0.437+ runtime 使用 aws-sdk-js/1.0.0 + api/kiroruntime + KAS
 pub const RUNTIME_STREAMING_SDK_VERSION: &str = "1.0.0";
+/// Kiro IDE 1.2.4 的 `/mcp` 仍走旧 codewhispererstreaming SDK（不带 KAS）
+pub const MCP_STREAMING_SDK_VERSION: &str = "1.0.39";
 
 /// Kiro CLI / Amazon Q for CLI（抓包 2026-07-14，kiro-cli 2.12.1）
 pub const CLI_RUST_SDK_VERSION: &str = "1.3.15";
@@ -53,6 +55,19 @@ pub fn runtime_streaming_user_agent(machine_id: &str) -> String {
         RUNTIME_STREAMING_SDK_VERSION,
         &kiro_ide_kas_label(machine_id),
         "kiroruntime",
+        "m/N",
+    )
+}
+
+pub fn mcp_x_amz_user_agent(machine_id: &str) -> String {
+    build_x_amz_user_agent(MCP_STREAMING_SDK_VERSION, &kiro_ide_label(machine_id))
+}
+
+pub fn mcp_user_agent(machine_id: &str) -> String {
+    build_user_agent(
+        MCP_STREAMING_SDK_VERSION,
+        &kiro_ide_label(machine_id),
+        "codewhispererstreaming",
         "m/N",
     )
 }
@@ -153,6 +168,21 @@ mod tests {
             format!("aws-sdk-js/1.0.0 KiroIDE-{}-machine123", KIRO_VERSION)
         );
         assert!(!ua.contains("KAS/"));
+    }
+
+    #[test]
+    fn test_mcp_user_agent_matches_ide_capture() {
+        assert_eq!(
+            mcp_x_amz_user_agent("machine123"),
+            format!("aws-sdk-js/1.0.39 KiroIDE-{}-machine123", KIRO_VERSION)
+        );
+        assert_eq!(
+            mcp_user_agent("machine123"),
+            format!(
+                "aws-sdk-js/1.0.39 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.39 m/N KiroIDE-{}-machine123",
+                SYSTEM_VERSION, NODE_VERSION, KIRO_VERSION
+            )
+        );
     }
 
     #[test]

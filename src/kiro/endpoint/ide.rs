@@ -1,6 +1,6 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 1.0.437 客户端当前使用的 Kiro Runtime 端点：
+//! 对应 Kiro IDE 1.2.4 客户端当前使用的 Kiro Runtime 端点：
 //! - API: `https://runtime.{api_region}.kiro.dev` + `x-amz-target: KiroRuntimeService.GenerateAssistantResponse`
 //! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
@@ -41,7 +41,7 @@ impl IdeEndpoint {
         user_agent::runtime_streaming_user_agent(ctx.machine_id)
     }
 
-    /// 官方 Kiro 1.0.437 使用 `TokenType` 头：
+    /// 官方 Kiro 1.2.4 使用 `TokenType` 头：
     /// - SSO 登录: SSO_OIDC
     /// - API Key: API_KEY
     fn token_type(&self, ctx: &RequestContext<'_>) -> &'static str {
@@ -83,6 +83,7 @@ impl KiroEndpoint for IdeEndpoint {
             "x-amz-target",
             "KiroRuntimeService.GenerateAssistantResponse",
         )
+        .header("x-amzn-codewhisperer-optout", "true")
         .header("x-amzn-kiro-client-attribution", "kiro-ide")
         .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
         .header("user-agent", self.user_agent(ctx))
@@ -95,19 +96,21 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
-            .header("TokenType", self.token_type(ctx))
-            .header("Authorization", format!("Bearer {}", ctx.token));
-
+        // 官方 1.2.4 `/mcp`：codewhispererstreaming#1.0.39 UA、无 KAS、SSO 不带 TokenType
+        let mut req = req;
         if let Some(ref arn) = ctx.credentials.profile_arn {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        req
+        req = req
+            .header("x-amz-user-agent", user_agent::mcp_x_amz_user_agent(ctx.machine_id))
+            .header("user-agent", user_agent::mcp_user_agent(ctx.machine_id))
+            .header("host", self.host(ctx))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=3");
+        if ctx.credentials.is_api_key_credential() {
+            req = req.header("TokenType", "API_KEY");
+        }
+        req.header("Authorization", format!("Bearer {}", ctx.token))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {

@@ -496,7 +496,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    // 14. 根级字段：与官方 Kiro 1.0.437 GPT / Claude 抓包对齐
+    // 14. 根级字段：与官方 Kiro 1.2.4 GPT / Claude 抓包对齐
     // - agentMode: vibe
     // - additionalModelRequestFields.reasoning.effort: GPT 必需
     let agent_mode = Some("vibe".to_string());
@@ -516,10 +516,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
 /// 构建官方 Kiro 根级 additionalModelRequestFields
 ///
-/// 官方 1.0.437 ListAvailableModels + GenerateAssistantResponse 抓包：
+/// 官方 1.2.4 ListAvailableModels + GenerateAssistantResponse 抓包：
 /// - GPT-5.6：`{"reasoning":{"effort":"none|low|medium|high|xhigh|max"}}`，默认 `high`
 /// - Claude Opus/Sonnet 4.6+ / 5：`{"output_config":{"effort":"low|medium|high|xhigh|max"}}`
-///   - 4.6 无 `xhigh`；4.7 默认 `xhigh`；其余默认 `high`
+///   - 4.6 无 `xhigh`；4.7 默认 `xhigh`；Opus 5.5 默认 `medium`；其余默认 `high`
 /// - Claude 4.5 / Haiku / Sonnet 4：不发送
 /// 官方 IDE 把 UI effortLevel 原样写入 schema path，不做数值换算。
 fn supports_additional_model_request_fields(model_id: &str) -> bool {
@@ -552,8 +552,10 @@ fn default_effort_for_model(model_id: &str) -> &'static str {
     if is_gpt_upstream_model(model_id) {
         return "high";
     }
+    let is_opus = model_id.to_ascii_lowercase().starts_with("claude-opus-");
     match parse_claude_family_version(model_id) {
         Some((4, 7)) => "xhigh",
+        Some((5, 5)) if is_opus => "medium",
         _ => "high",
     }
 }
@@ -2696,6 +2698,23 @@ mod tests {
         assert_eq!(
             result.additional_model_request_fields.unwrap()["output_config"]["effort"],
             "xhigh"
+        );
+    }
+
+    #[test]
+    fn test_claude_opus_55_default_effort_is_medium() {
+        // 官方 1.2.4 ListAvailableModels：claude-opus-5.5 default = medium
+        let result =
+            convert_request(&sample_messages_request("claude-opus-5.5", None)).expect("convert");
+        assert_eq!(
+            result.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "medium"
+        );
+        let sonnet =
+            convert_request(&sample_messages_request("claude-sonnet-5.5", None)).expect("convert");
+        assert_eq!(
+            sonnet.additional_model_request_fields.unwrap()["output_config"]["effort"],
+            "high"
         );
     }
 

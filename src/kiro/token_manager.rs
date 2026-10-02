@@ -571,7 +571,7 @@ pub(crate) async fn list_available_models(
         .header("user-agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("amz-sdk-request", "attempt=1; max=3")
         .header("Authorization", format!("Bearer {}", token))
         .header("Connection", "close")
         .json(&body);

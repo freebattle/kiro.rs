@@ -359,7 +359,7 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    // agentMode / additionalModelRequestFields 对齐官方 Kiro 1.0.437 GPT / Claude 抓包
+    // agentMode / additionalModelRequestFields 对齐官方 Kiro 1.2.4 GPT / Claude 抓包
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -881,8 +881,11 @@ async fn handle_non_stream_request(
                         }
                         Event::ReasoningContent(reasoning) => {
                             if let Some(ref text) = reasoning.text {
+                                // Claude 上游 reasoning 为多帧增量，需累加
                                 if !text.is_empty() {
-                                    reasoning_text = Some(text.clone());
+                                    reasoning_text
+                                        .get_or_insert_with(String::new)
+                                        .push_str(text);
                                 }
                             }
                             // IDE signature / CLI GPT redactedContent

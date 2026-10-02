@@ -1162,10 +1162,17 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
-        if let Some(text) = reasoning.text.as_ref() {
-            if !text.is_empty() {
-                self.reasoning_text = Some(text.clone());
-            }
+        // Claude 上游把思维链拆成多帧 `{"text": 增量}` 流式下发，最后一帧只带 signature，
+        // 因此这里必须累加而不是覆盖。
+        let text_delta = reasoning
+            .text
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .cloned();
+        if let Some(text) = text_delta.as_ref() {
+            self.reasoning_text
+                .get_or_insert_with(String::new)
+                .push_str(text);
         }
         // IDE: signature；CLI GPT: redactedContent（整段 blob 当 signature 回灌）
         if let Some(sig) = reasoning.effective_signature() {
@@ -1232,19 +1239,24 @@ impl StreamContext {
                     events.push(stop_event);
                 }
             }
-        } else if let (Some(thinking_index), Some(sig)) =
-            (self.thinking_block_index, self.reasoning_signature.clone())
-        {
-            // 补发 signature 并关闭（处理 text/signature 分片到达）
+        } else if let Some(thinking_index) = self.thinking_block_index {
             if self
                 .state_manager
                 .is_block_open_of_type(thinking_index, "thinking")
             {
-                events.push(self.create_signature_delta_event(thinking_index, &sig));
-                if let Some(stop_event) =
-                    self.state_manager.handle_content_block_stop(thinking_index)
-                {
-                    events.push(stop_event);
+                // 后续增量 reasoning 文本
+                if let Some(text) = text_delta.as_ref() {
+                    self.output_tokens += estimate_tokens(text);
+                    events.push(self.create_thinking_delta_event(thinking_index, text));
+                }
+                // 补发 signature 并关闭（处理 text/signature 分片到达）
+                if let Some(sig) = self.reasoning_signature.clone() {
+                    events.push(self.create_signature_delta_event(thinking_index, &sig));
+                    if let Some(stop_event) =
+                        self.state_manager.handle_content_block_stop(thinking_index)
+                    {
+                        events.push(stop_event);
+                    }
                 }
             }
         }
@@ -2541,5 +2553,42 @@ mod tests {
         let events = ctx.process_kiro_event(&Event::ReasoningContent(reasoning));
         assert!(events.is_empty());
         assert_eq!(ctx.reasoning_signature.as_deref(), Some("EoYDsig"));
+    }
+
+    #[test]
+    fn test_claude_incremental_reasoning_text_streams_all_deltas() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+
+        // Claude 上游：多帧 {"text": 增量}，最后一帧只带 signature
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5.5", 1, 0, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        for frame in [
+            serde_json::json!({"text": "The"}),
+            serde_json::json!({"text": " output"}),
+            serde_json::json!({"text": " looks off.\n\n"}),
+            serde_json::json!({"signature": "CAQSsig"}),
+        ] {
+            let reasoning: ReasoningContentEvent = serde_json::from_value(frame).unwrap();
+            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(reasoning)));
+        }
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "答案"})).unwrap();
+        all.extend(ctx.process_kiro_event(&Event::AssistantResponse(assistant)));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "The output looks off.\n\n");
+        assert_eq!(ctx.reasoning_text.as_deref(), Some("The output looks off.\n\n"));
+        assert_eq!(collect_text_content(&all), "答案");
+        let signatures: Vec<_> = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|e| e.data["delta"]["signature"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(signatures, vec!["CAQSsig".to_string()]);
     }
 }
