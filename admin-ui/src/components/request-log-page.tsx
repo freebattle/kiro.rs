@@ -114,7 +114,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">输入 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{(stats.totalInputTokens - stats.totalCacheReadTokens).toLocaleString()}</div>
+                <div className="text-2xl font-bold">{formatTokens(stats.totalInputTokens - stats.totalCacheReadTokens)}</div>
               </CardContent>
             </Card>
             <Card>
@@ -122,7 +122,7 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                 <CardTitle className="text-sm font-medium text-muted-foreground">输出 Tokens</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-2xl font-bold">{stats.totalOutputTokens.toLocaleString()}</div>
+                <div className="text-2xl font-bold">{formatTokens(stats.totalOutputTokens)}</div>
               </CardContent>
             </Card>
             <Card>
@@ -180,11 +180,11 @@ export function RequestLogPage({ onBack }: RequestLogPageProps) {
                           {row.credits > 0 ? formatCredits(row.credits) : '-'}
                         </td>
                         <td className="p-3 text-right tabular-nums">
-                          {Math.max(0, row.inputTokens - row.cacheReadTokens).toLocaleString()}
+                          {formatTokens(Math.max(0, row.inputTokens - row.cacheReadTokens))}
                         </td>
-                        <td className="p-3 text-right tabular-nums">{row.outputTokens.toLocaleString()}</td>
+                        <td className="p-3 text-right tabular-nums">{formatTokens(row.outputTokens)}</td>
                         <td className="p-3 text-right tabular-nums text-green-500">
-                          {row.cacheReadTokens > 0 ? formatTokenCount(row.cacheReadTokens) : '-'}
+                          {row.cacheReadTokens > 0 ? formatTokens(row.cacheReadTokens) : '-'}
                         </td>
                       </tr>
                     ))}
@@ -326,9 +326,15 @@ function formatDuration(ms: number): string {
 }
 
 function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000) return `${formatCompact(n / 1_000_000)}M`
+  if (abs >= 1_000) return `${formatCompact(n / 1_000)}k`
   return String(n)
+}
+
+function formatCompact(value: number): string {
+  const rounded = Math.round(value * 10) / 10
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
 }
 
 function formatTokenCount(n: number): string {
