@@ -39,6 +39,11 @@ pub trait KiroEndpoint: Send + Sync {
         "application/json"
     }
 
+    /// MCP 请求 Content-Type（Kiro IDE 1.2.56 InvokeMCP 为 application/x-amz-json-1.0）
+    fn mcp_content_type(&self) -> &'static str {
+        "application/json"
+    }
+
     /// 装饰 API 请求的端点特有 header
     ///
     /// Provider 已经设置好 URL、content-type、Connection 和 body；

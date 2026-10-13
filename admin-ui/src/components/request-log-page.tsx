@@ -327,7 +327,8 @@ function formatDuration(ms: number): string {
 
 function formatTokens(n: number): string {
   const abs = Math.abs(n)
-  if (abs >= 1_000_000) return `${formatCompact(n / 1_000_000)}M`
+  if (abs >= 1_000_000_000) return `${formatCompact(n / 1_000_000_000)}b`
+  if (abs >= 1_000_000) return `${formatCompact(n / 1_000_000)}m`
   if (abs >= 1_000) return `${formatCompact(n / 1_000)}k`
   return String(n)
 }

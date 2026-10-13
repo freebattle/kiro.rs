@@ -1,11 +1,11 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 1.2.4 客户端当前使用的 Kiro Runtime 端点：
+//! 对应 Kiro IDE 1.2.56 客户端当前使用的 Kiro Runtime 端点：
 //! - API: `https://runtime.{api_region}.kiro.dev` + `x-amz-target: KiroRuntimeService.GenerateAssistantResponse`
-//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
+//! - MCP: `https://runtime.{api_region}.kiro.dev` + `x-amz-target: KiroRuntimeService.InvokeMCP`
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识（api/kiroruntime#1.0.0）。
-//! 请求体会在根对象上注入 `profileArn`。
+//! API 与 MCP 请求体都会在根对象上注入 `profileArn`。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -41,7 +41,7 @@ impl IdeEndpoint {
         user_agent::runtime_streaming_user_agent(ctx.machine_id)
     }
 
-    /// 官方 Kiro 1.2.4 使用 `TokenType` 头：
+    /// 官方 Kiro 1.2.56 使用 `TokenType` 头：
     /// - SSO 登录: SSO_OIDC
     /// - API Key: API_KEY
     fn token_type(&self, ctx: &RequestContext<'_>) -> &'static str {
@@ -70,10 +70,15 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+        // 1.2.56：MCP 改走根路径 + x-amz-target InvokeMCP，不再请求 /mcp
+        format!("https://runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn api_content_type(&self) -> &'static str {
+        "application/x-amz-json-1.0"
+    }
+
+    fn mcp_content_type(&self) -> &'static str {
         "application/x-amz-json-1.0"
     }
 
@@ -96,24 +101,23 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        // 官方 1.2.4 `/mcp`：codewhispererstreaming#1.0.39 UA、无 KAS、SSO 不带 TokenType
-        let mut req = req;
-        if let Some(ref arn) = ctx.credentials.profile_arn {
-            req = req.header("x-amzn-kiro-profile-arn", arn);
-        }
-        req = req
-            .header("x-amz-user-agent", user_agent::mcp_x_amz_user_agent(ctx.machine_id))
-            .header("user-agent", user_agent::mcp_user_agent(ctx.machine_id))
+        // 官方 1.2.56 InvokeMCP：与 GenerateAssistantResponse 同 runtime UA（含 KAS），
+        // 总带 TokenType；profileArn 在请求体内，不再发 x-amzn-kiro-profile-arn 头
+        req.header("x-amz-target", "KiroRuntimeService.InvokeMCP")
+            .header("TokenType", self.token_type(ctx))
+            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3");
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("TokenType", "API_KEY");
-        }
-        req.header("Authorization", format!("Bearer {}", ctx.token))
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", ctx.token))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        inject_profile_arn(body, &ctx.credentials.profile_arn)
+    }
+
+    fn transform_mcp_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
         inject_profile_arn(body, &ctx.credentials.profile_arn)
     }
 }
@@ -133,8 +137,72 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{IdeEndpoint, inject_profile_arn};
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::{Config, KAS_VERSION, KIRO_VERSION};
     use serde_json::Value;
+
+    /// 对齐官方 1.2.56 抓包：web_search 走根路径 KiroRuntimeService.InvokeMCP
+    #[test]
+    fn test_mcp_request_matches_invoke_mcp_capture() {
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "tok",
+            machine_id: "machine123",
+            config: &config,
+        };
+        let endpoint = IdeEndpoint::new();
+
+        let url = endpoint.mcp_url(&ctx);
+        assert_eq!(url, "https://runtime.us-east-1.kiro.dev");
+        assert_eq!(endpoint.mcp_content_type(), "application/x-amz-json-1.0");
+
+        let req = endpoint
+            .decorate_mcp(reqwest::Client::new().post(&url), &ctx)
+            .build()
+            .unwrap();
+        let header = |name: &str| {
+            req.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header("x-amz-target").as_deref(),
+            Some("KiroRuntimeService.InvokeMCP")
+        );
+        assert_eq!(header("TokenType").as_deref(), Some("SSO_OIDC"));
+        assert_eq!(header("amz-sdk-request").as_deref(), Some("attempt=1; max=3"));
+        assert_eq!(
+            header("x-amz-user-agent"),
+            Some(format!(
+                "aws-sdk-js/1.0.0 KiroIDE-{}-machine123-KAS/{}",
+                KIRO_VERSION, KAS_VERSION
+            ))
+        );
+        assert!(
+            header("user-agent")
+                .unwrap()
+                .contains("api/kiroruntime#1.0.0 m/N KiroIDE-")
+        );
+        assert!(header("x-amzn-kiro-profile-arn").is_none());
+        assert!(header("x-kiro-attempt").is_none());
+
+        let body = endpoint.transform_mcp_body(
+            r#"{"id":"web_search_x","jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search","arguments":{"query":"q"}}}"#,
+            &ctx,
+        );
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+        );
+        assert_eq!(json["params"]["arguments"]["query"], "q");
+    }
 
     #[test]
     fn test_inject_profile_arn_with_some() {

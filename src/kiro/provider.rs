@@ -166,7 +166,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.mcp_content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
