@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartIdcLoginRequest {
+    /// 重新登录时可留空，沿用凭据原有的 authRegion
+    #[serde(default)]
     pub region: String,
     #[serde(default)]
     pub start_url: Option<String>,

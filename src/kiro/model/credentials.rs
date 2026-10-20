@@ -124,6 +124,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_exhausted_at: Option<String>,
 
+    /// 自动禁用原因（如 InvalidRefreshToken），随 disabled 一起持久化，
+    /// 避免重启后所有禁用都被当成手动禁用
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -451,6 +457,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             quota_exhausted_at: None,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -575,6 +582,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             quota_exhausted_at: None,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -612,6 +620,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             quota_exhausted_at: None,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -732,6 +741,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             quota_exhausted_at: None,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
         };

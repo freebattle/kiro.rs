@@ -112,17 +112,25 @@ interface IdcLoginDialogProps {
   onSuccess: () => void
   /** 登录模式：'builder-id' 为 AWS Builder ID；'enterprise' 为企业 IAM Identity Center SSO */
   mode?: 'builder-id' | 'enterprise'
+  /** 企业模式预填（取已有企业 IdC 凭据的 Start URL / 区域） */
+  defaultStartUrl?: string
+  defaultRegion?: string
 }
 
 type Step = 'form' | 'waiting' | 'done'
 
-function defaultRegionForMode(mode: 'builder-id' | 'enterprise') {
-  // 企业 IAM Identity Center 常见部署在 ap-southeast-1；Builder ID 默认 us-east-1
-  return mode === 'enterprise' ? 'ap-southeast-1' : 'us-east-1'
-}
-
-export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-id' }: IdcLoginDialogProps) {
+export function IdcLoginDialog({
+  open,
+  onOpenChange,
+  onSuccess,
+  mode = 'builder-id',
+  defaultStartUrl,
+  defaultRegion,
+}: IdcLoginDialogProps) {
   const isEnterprise = mode === 'enterprise'
+  // 企业 IAM Identity Center 常见部署在 ap-southeast-1；Builder ID 默认 us-east-1
+  const defaultRegionForMode = (m: 'builder-id' | 'enterprise') =>
+    m === 'enterprise' ? (defaultRegion || 'ap-southeast-1') : 'us-east-1'
   const [step, setStep] = useState<Step>('form')
   const [region, setRegion] = useState(() => defaultRegionForMode(mode))
   const [startUrl, setStartUrl] = useState('')
@@ -141,12 +149,14 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
     }
   }, [])
 
-  // 打开对话框或切换模式时，重置默认 SSO 区域
+  // 打开对话框或切换模式时，重置默认 SSO 区域，企业模式预填已有的 Start URL
   useEffect(() => {
     if (open && step === 'form') {
       setRegion(defaultRegionForMode(mode))
+      setStartUrl(mode === 'enterprise' ? (defaultStartUrl ?? '') : '')
     }
-  }, [open, mode, step])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, mode, defaultStartUrl, defaultRegion])
 
   // 对话框关闭时重置状态
   const handleOpenChange = (v: boolean) => {

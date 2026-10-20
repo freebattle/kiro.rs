@@ -87,6 +87,13 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                provider: entry.provider,
+                start_url: entry.start_url,
+                auth_region: entry.auth_region,
+                subscription_title: entry.subscription_title,
+                quota_exhausted_at: entry.quota_exhausted_at,
+                last_error: entry.last_error,
+                last_error_at: entry.last_error_at,
             })
             .collect();
 
@@ -123,6 +130,14 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置优先级
+    pub fn set_priorities(&self, updates: &[(u64, u32)]) -> Result<(), AdminServiceError> {
+        let first_id = updates.first().map(|(id, _)| *id).unwrap_or(0);
+        self.token_manager
+            .set_priorities(updates)
+            .map_err(|e| self.classify_error(e, first_id))
     }
 
     /// 重置失败计数并重新启用
@@ -239,6 +254,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             quota_exhausted_at: None,
+            disabled_reason: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };

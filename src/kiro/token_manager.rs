@@ -768,6 +768,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 最近一次凭据相关错误（刷新失败 / 401 / 403），调用成功或重新启用后清空；仅内存
+    last_error: Option<String>,
+    /// 最近一次错误时间（RFC3339 格式）
+    last_error_at: Option<String>,
 }
 
 /// 禁用原因
@@ -786,6 +790,34 @@ enum DisabledReason {
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
 }
+
+impl DisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Manual" => Some(DisabledReason::Manual),
+            "TooManyFailures" => Some(DisabledReason::TooManyFailures),
+            "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
+            "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+            "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+            _ => None,
+        }
+    }
+}
+
+/// 最近错误信息的最大长度（上游错误体可能很长，只保留开头用于展示）
+const MAX_LAST_ERROR_LEN: usize = 300;
 
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
@@ -841,6 +873,20 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 身份提供商（BuilderId / Enterprise / AzureAD 等）
+    pub provider: Option<String>,
+    /// IdC Start URL（重新登录时预填）
+    pub start_url: Option<String>,
+    /// OIDC/SSO 区域（重新登录时预填）
+    pub auth_region: Option<String>,
+    /// 订阅等级
+    pub subscription_title: Option<String>,
+    /// 额度用尽时间
+    pub quota_exhausted_at: Option<String>,
+    /// 最近一次凭据相关错误
+    pub last_error: Option<String>,
+    /// 最近一次错误时间
+    pub last_error_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -951,10 +997,17 @@ impl MultiTokenManager {
                     } else if cred.quota_exhausted_at.is_some() {
                         Some(DisabledReason::QuotaExceeded)
                     } else {
-                        Some(DisabledReason::Manual)
+                        Some(
+                            cred.disabled_reason
+                                .as_deref()
+                                .and_then(DisabledReason::parse)
+                                .unwrap_or(DisabledReason::Manual),
+                        )
                     },
                     success_count: 0,
                     last_used_at: None,
+                    last_error: None,
+                    last_error_at: None,
                 }
             })
             .collect();
@@ -1082,11 +1135,14 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 分层 Least-Used：只在优先级最高（数字最小）的一层里均衡，
+                // 层内选成功次数最少的凭据。把某个凭据单独设为更高优先级即可集中消耗它，
+                // 所有凭据优先级相同时等价于全局均衡。
+                let top_priority = available.iter().map(|e| e.credentials.priority).min()?;
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .filter(|e| e.credentials.priority == top_priority)
+                    .min_by_key(|e| e.success_count)?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1130,11 +1186,18 @@ impl MultiTokenManager {
                 let current_hit = if is_balanced {
                     None
                 } else {
+                    let needs_opus = model
+                        .map(|m| m.to_lowercase().contains("opus"))
+                        .unwrap_or(false);
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && (!needs_opus || e.credentials.supports_opus())
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -1188,6 +1251,7 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
+                    self.record_error(id, format!("Token 刷新失败: {}", e));
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
                         self.report_refresh_token_invalid(id)
@@ -1421,6 +1485,13 @@ impl MultiTokenManager {
                     if e.disabled_reason != Some(DisabledReason::QuotaExceeded) {
                         cred.quota_exhausted_at = None;
                     }
+                    // InvalidConfig 每次启动都会重新校验，不落盘
+                    cred.disabled_reason = match e.disabled_reason {
+                        Some(r) if e.disabled && r != DisabledReason::InvalidConfig => {
+                            Some(r.as_str().to_string())
+                        }
+                        _ => None,
+                    };
                     cred
                 })
                 .collect()
@@ -1552,6 +1623,8 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.last_error = None;
+                entry.last_error_at = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1560,6 +1633,22 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 记录凭据最近一次错误（用于 Admin 面板展示登录态问题）
+    pub fn record_error(&self, id: u64, message: impl AsRef<str>) {
+        let message = message.as_ref().trim();
+        let message: String = if message.chars().count() > MAX_LAST_ERROR_LEN {
+            let truncated: String = message.chars().take(MAX_LAST_ERROR_LEN).collect();
+            format!("{}…", truncated)
+        } else {
+            message.to_string()
+        };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.last_error = Some(message);
+            entry.last_error_at = Some(Utc::now().to_rfc3339());
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1997,18 +2086,15 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                        }
-                        .to_string()
-                    }),
+                    disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    provider: e.credentials.provider.clone(),
+                    start_url: e.credentials.start_url.clone(),
+                    auth_region: e.credentials.auth_region.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
+                    quota_exhausted_at: e.credentials.quota_exhausted_at.clone(),
+                    last_error: e.last_error.clone(),
+                    last_error_at: e.last_error_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -2031,6 +2117,8 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.last_error = None;
+                entry.last_error_at = None;
                 entry.credentials.quota_exhausted_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
@@ -2062,6 +2150,27 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量设置优先级（Admin API），全部校验通过后才修改，一次落盘
+    pub fn set_priorities(&self, updates: &[(u64, u32)]) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            if let Some((missing, _)) = updates
+                .iter()
+                .find(|(id, _)| !entries.iter().any(|e| e.id == *id))
+            {
+                anyhow::bail!("凭据不存在: {}", missing);
+            }
+            for (id, priority) in updates {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                    entry.credentials.priority = *priority;
+                }
+            }
+        }
+        self.select_highest_priority();
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -2078,6 +2187,8 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             entry.credentials.quota_exhausted_at = None;
+            entry.last_error = None;
+            entry.last_error_at = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2205,6 +2316,76 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         tracing::info!("凭据 #{} external_idp Token 已更新", id);
+        Ok(())
+    }
+
+    /// 更新 IdC 重新登录拿到的 token 和 OIDC 客户端信息。
+    ///
+    /// 重新登录会注册新的 OIDC 客户端，新 refreshToken 只能用新的 clientId/clientSecret 刷新，
+    /// 所以必须连同客户端信息、startUrl、authRegion 一起替换。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_idc_relogin(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+        client_id: String,
+        client_secret: String,
+        start_url: String,
+        auth_region: String,
+        provider: String,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!(
+                    "只能为已禁用的凭据更新 IdC Token（请先禁用凭据 #{}）",
+                    id
+                );
+            }
+
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                auth_method: Some("idc".to_string()),
+                client_id: Some(client_id.clone()),
+                client_secret: Some(client_secret.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.credentials.auth_method = Some("idc".to_string());
+            entry.credentials.provider = Some(provider);
+            entry.credentials.client_id = Some(client_id);
+            entry.credentials.client_secret = Some(client_secret);
+            entry.credentials.start_url = Some(start_url);
+            entry.credentials.auth_region = Some(auth_region);
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} IdC Token 已更新", id);
         Ok(())
     }
 
@@ -2508,6 +2689,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                last_error: None,
+                last_error_at: None,
             });
         }
 
@@ -3169,6 +3352,170 @@ mod tests {
         assert!(first.disabled);
         assert_eq!(first.refresh_failure_count, MAX_FAILURES_PER_CREDENTIAL);
         assert_eq!(snapshot.current_id, 2);
+    }
+
+    fn ready_cred(token: &str, priority: u32) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.priority = priority;
+        cred.access_token = Some(token.to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.profile_arn = Some(format!("arn:aws:codewhisperer:profile/{}", token));
+        cred
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_only_balances_within_top_priority_tier() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![ready_cred("a", 0), ready_cred("b", 0), ready_cred("c", 1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut used = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let ctx = manager.acquire_context(None).await.unwrap();
+            manager.report_success(ctx.id);
+            used.insert(ctx.id);
+        }
+        // c 优先级更低，有更高优先级可用凭据时不参与均衡
+        assert_eq!(used, [1, 2].into_iter().collect());
+
+        // 把 c 单独提到最高优先级后，流量集中到 c
+        manager.set_priorities(&[(3, 0), (1, 1), (2, 1)]).unwrap();
+        for _ in 0..3 {
+            let ctx = manager.acquire_context(None).await.unwrap();
+            assert_eq!(ctx.id, 3);
+            manager.report_success(ctx.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_current_credential_respects_opus_filter() {
+        let config = Config::default();
+        let mut free = ready_cred("free", 0);
+        free.subscription_title = Some("KIRO FREE".to_string());
+        let pro = ready_cred("pro", 1);
+        let manager = MultiTokenManager::new(config, vec![free, pro], None, None, false).unwrap();
+
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(Some("claude-opus-5-5")).await.unwrap().id, 2);
+    }
+
+    #[test]
+    fn test_set_priorities_rejects_unknown_id_without_partial_update() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![ready_cred("a", 0), ready_cred("b", 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.set_priorities(&[(1, 5), (99, 0)]).is_err());
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries.iter().all(|e| e.priority == 0));
+    }
+
+    #[test]
+    fn test_disabled_reason_survives_restart() {
+        let path = std::env::temp_dir().join(format!("kiro-creds-{}.json", uuid::Uuid::new_v4()));
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![ready_cred("a", 0), ready_cred("b", 0)],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.report_refresh_token_invalid(1);
+        manager.set_disabled(2, true).unwrap();
+
+        let saved: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restarted =
+            MultiTokenManager::new(Config::default(), saved, None, Some(path.clone()), true)
+                .unwrap();
+        let snapshot = restarted.snapshot();
+        let reason = |id: u64| {
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .disabled_reason
+                .clone()
+        };
+        assert_eq!(reason(1).as_deref(), Some("InvalidRefreshToken"));
+        assert_eq!(reason(2).as_deref(), Some("Manual"));
+
+        // 重新启用后不再落盘禁用原因
+        restarted.set_disabled(1, false).unwrap();
+        let saved: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.iter().find(|c| c.id == Some(1)).unwrap().disabled_reason.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_record_error_is_cleared_by_success_and_truncated() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![ready_cred("a", 0)], None, None, false)
+                .unwrap();
+        manager.record_error(1, "x".repeat(MAX_LAST_ERROR_LEN + 50));
+        let err = manager.snapshot().entries[0].last_error.clone().unwrap();
+        assert_eq!(err.chars().count(), MAX_LAST_ERROR_LEN + 1);
+        assert!(manager.snapshot().entries[0].last_error_at.is_some());
+
+        manager.report_success(1);
+        assert!(manager.snapshot().entries[0].last_error.is_none());
+    }
+
+    #[test]
+    fn test_update_idc_relogin_replaces_oidc_client() {
+        let mut cred = ready_cred("a", 0);
+        cred.auth_method = Some("idc".to_string());
+        cred.refresh_token = Some("old-refresh".repeat(20));
+        cred.client_id = Some("old-client".to_string());
+        cred.client_secret = Some("old-secret".to_string());
+        cred.start_url = Some("https://view.awsapps.com/start".to_string());
+        cred.auth_region = Some("us-east-1".to_string());
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        // 未禁用时拒绝更新
+        let new_refresh = "new-refresh".repeat(20);
+        let args = |m: &MultiTokenManager| {
+            m.update_idc_relogin(
+                1,
+                new_refresh.clone(),
+                Some("new-access".to_string()),
+                None,
+                "new-client".to_string(),
+                "new-secret".to_string(),
+                "https://example.awsapps.com/start".to_string(),
+                "ap-southeast-1".to_string(),
+                "Enterprise".to_string(),
+            )
+        };
+        assert!(args(&manager).is_err());
+
+        manager.set_disabled(1, true).unwrap();
+        args(&manager).unwrap();
+        let entries = manager.entries.lock();
+        let c = &entries[0].credentials;
+        assert_eq!(c.refresh_token.as_deref(), Some(new_refresh.as_str()));
+        assert_eq!(c.access_token.as_deref(), Some("new-access"));
+        assert_eq!(c.client_id.as_deref(), Some("new-client"));
+        assert_eq!(c.client_secret.as_deref(), Some("new-secret"));
+        assert_eq!(c.start_url.as_deref(), Some("https://example.awsapps.com/start"));
+        assert_eq!(c.auth_region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(c.provider.as_deref(), Some("Enterprise"));
     }
 
     #[tokio::test]

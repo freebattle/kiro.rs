@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, FileText, BarChart3, Github, KeyRound, Building2, ChevronDown, PenLine, ArrowUpToLine } from 'lucide-react'
 
 const APP_VERSION = __APP_VERSION__
@@ -24,11 +24,14 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { IdcLoginDialog } from '@/components/idc-login-dialog'
 import { ReloginDialog } from '@/components/relogin-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken, setCredentialPriority } from '@/api/credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetPriorities } from '@/hooks/use-credentials'
+import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { getRequestLogs, type RequestRecord } from '@/api/requests'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import { buildFocusUpdates, buildResetUpdates, getCredentialHealth, isFocused } from '@/lib/credential-health'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+
+type CredentialFilter = 'all' | 'attention' | 'disabled'
 
 interface DashboardProps {
   onLogout: () => void
@@ -40,7 +43,8 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [socialLoginOpen, setSocialLoginOpen] = useState(false)
   const [idcLoginOpen, setIdcLoginOpen] = useState(false)
   const [idcLoginMode, setIdcLoginMode] = useState<'builder-id' | 'enterprise'>('builder-id')
-  const [reloginTarget, setReloginTarget] = useState<{ id: number; authMethod: string | null } | null>(null)
+  const [reloginTargetId, setReloginTargetId] = useState<number | null>(null)
+  const [filter, setFilter] = useState<CredentialFilter>('all')
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -59,7 +63,6 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [prioritizing, setPrioritizing] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -76,30 +79,47 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { mutateAsync: setPriorities, isPending: prioritizing } = useSetPriorities()
 
   useEffect(() => {
     storage.setBalanceCache(balanceMap)
   }, [balanceMap])
 
+  const allCredentials = data?.credentials ?? []
+  const attentionCount = allCredentials.filter(c => getCredentialHealth(c).needsAttention).length
+  const disabledCredentialCount = allCredentials.filter(credential => credential.disabled).length
+  const filteredCredentials = allCredentials.filter(c => {
+    if (filter === 'attention') return getCredentialHealth(c).needsAttention
+    if (filter === 'disabled') return c.disabled
+    return true
+  })
+  const focusedId = allCredentials.find(c => isFocused(c, allCredentials))?.id ?? null
+  const hasCustomPriority = allCredentials.some(c => c.priority !== 0)
+  const knownBalances = allCredentials
+    .filter(c => !c.disabled)
+    .map(c => balanceMap.get(c.id))
+    .filter((b): b is BalanceResponse => Boolean(b))
+  const remainingTotal = knownBalances.reduce((sum, b) => sum + b.remaining, 0)
+  const reloginTarget = allCredentials.find(c => c.id === reloginTargetId) ?? null
+  const enterpriseIdc = allCredentials.find(
+    c => c.authMethod === 'idc' && c.provider === 'Enterprise' && c.startUrl,
+  )
+
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = filteredCredentials.slice(startIndex, endIndex)
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
-  const singleSelected = selectedIds.size === 1
-    ? data?.credentials.find(c => c.id === Array.from(selectedIds)[0])
-    : undefined
-  const isPriorityMode = (loadBalancingData?.mode ?? 'priority') === 'priority'
+  const mode = loadBalancingData?.mode ?? 'priority'
 
-  // 当凭据列表变化时重置到第一页
+  // 当凭据列表或筛选变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [data?.credentials.length, filter])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -214,8 +234,8 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     document.documentElement.classList.toggle('dark')
   }
 
-  // 查询单个凭据余额，结果直接回填到卡片
-  const handleQueryBalance = async (id: number) => {
+  // 查询单个凭据余额，结果直接回填到卡片（useCallback 保持引用稳定，配合 CredentialCard 的 memo）
+  const handleQueryBalance = useCallback(async (id: number) => {
     setLoadingBalanceIds(prev => {
       const next = new Set(prev)
       next.add(id)
@@ -237,7 +257,7 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
         return next
       })
     }
-  }
+  }, [queryClient])
 
   const handleRefresh = () => {
     refetch()
@@ -253,15 +273,17 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   }
 
   // 选择管理
-  const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
-  }
+  const toggleSelect = useCallback((id: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }, [])
 
   const deselectAll = () => {
     setSelectedIds(new Set())
@@ -332,7 +354,6 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
     }
 
     const all = data?.credentials ?? []
-    // 先降级其他凭据，再提升选中凭据，保证后端最后一次重选落在选中凭据上
     const demotions = all
       .filter(c => !selectedIds.has(c.id) && c.priority === 0)
       .map(c => ({ id: c.id, priority: 1 }))
@@ -346,26 +367,43 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
       return
     }
 
-    setPrioritizing(true)
-
-    let failCount = 0
-    for (const update of updates) {
-      try {
-        await setCredentialPriority(update.id, update.priority)
-      } catch {
-        failCount++
-      }
-    }
-
-    setPrioritizing(false)
-    queryClient.invalidateQueries({ queryKey: ['credentials'] })
-
-    if (failCount === 0) {
-      toast.success(`已将 ${selectedIds.size} 个凭据置顶（优先级 0）`)
-    } else {
-      toast.warning(`置顶完成，其中 ${failCount} 个更新失败`)
+    try {
+      await setPriorities(updates)
+      toast.success(`已将 ${selectedIds.size} 个凭据置顶，请求只在它们之间分配`)
+    } catch (error) {
+      toast.error(`置顶失败: ${extractErrorMessage(error)}`)
     }
   }
+
+  // 集中消耗：该凭据优先级唯一最高，两种模式下请求都只走它
+  const handleFocus = useCallback(async (id: number) => {
+    const all = queryClient.getQueryData<{ credentials: CredentialStatusItem[] }>(['credentials'])?.credentials ?? []
+    const updates = buildFocusUpdates(id, all)
+    if (updates.length === 0) return
+    try {
+      await setPriorities(updates)
+      toast.success(`已集中消耗凭据 #${id}`)
+    } catch (error) {
+      toast.error(`设置失败: ${extractErrorMessage(error)}`)
+    }
+  }, [queryClient, setPriorities])
+
+  // 恢复均衡：所有优先级归 0
+  const handleResetPriorities = useCallback(async () => {
+    const all = queryClient.getQueryData<{ credentials: CredentialStatusItem[] }>(['credentials'])?.credentials ?? []
+    const updates = buildResetUpdates(all)
+    if (updates.length === 0) return
+    try {
+      await setPriorities(updates)
+      toast.success('已恢复均衡（所有优先级归 0）')
+    } catch (error) {
+      toast.error(`设置失败: ${extractErrorMessage(error)}`)
+    }
+  }, [queryClient, setPriorities])
+
+  const handleRelogin = useCallback((credential: CredentialStatusItem) => {
+    setReloginTargetId(credential.id)
+  }, [])
 
   // 批量恢复异常
   const handleBatchResetFailure = async () => {
@@ -743,9 +781,13 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
               size="sm"
               onClick={handleToggleLoadBalancing}
               disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
+              title={
+                mode === 'priority'
+                  ? '优先级模式：固定使用优先级最高的一个凭据，出故障才切换。点击切换为均衡负载'
+                  : '均衡负载：在优先级最高的一组凭据里轮流使用。点击切换为优先级模式'
+              }
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode ? '加载中...' : (mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
@@ -771,38 +813,80 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 grid-cols-2 md:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
+                可用 / 总数
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
+              <div className="text-2xl font-bold">
+                <span className="text-green-600">{data?.available || 0}</span>
+                <span className="text-muted-foreground text-lg"> / {data?.total || 0}</span>
               </div>
+            </CardContent>
+          </Card>
+          <Card
+            className={attentionCount > 0 ? 'cursor-pointer border-red-300 dark:border-red-900' : ''}
+            onClick={() => attentionCount > 0 && setFilter('attention')}
+          >
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                需处理
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className={`text-2xl font-bold ${attentionCount > 0 ? 'text-red-600' : 'text-muted-foreground'}`}>
+                {attentionCount}
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                {attentionCount > 0 ? '登录失效或连续失败，点击查看' : '登录态全部正常'}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                可用额度合计
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold tabular-nums">
+                {knownBalances.length > 0 ? remainingTotal.toFixed(0) : '-'}
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                {knownBalances.length > 0
+                  ? `已查询 ${knownBalances.length}/${data?.available || 0} 个启用凭据`
+                  : '点「查询信息」获取余额'}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                调度
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-lg font-bold">
+                {focusedId !== null
+                  ? `集中消耗 #${focusedId}`
+                  : mode === 'balanced' ? '均衡负载' : `优先级 · #${data?.currentId ?? '-'}`}
+              </div>
+              {hasCustomPriority ? (
+                <button
+                  type="button"
+                  className="text-xs text-primary hover:underline mt-1 disabled:opacity-50"
+                  onClick={handleResetPriorities}
+                  disabled={prioritizing}
+                  title="所有凭据优先级归 0"
+                >
+                  恢复均衡
+                </button>
+              ) : (
+                <p className="text-xs text-muted-foreground mt-1">所有凭据优先级相同</p>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -812,6 +896,24 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              <div className="inline-flex rounded-md border p-0.5 text-sm" role="tablist" aria-label="筛选凭据">
+                {([
+                  ['all', `全部 ${allCredentials.length}`],
+                  ['attention', `需处理 ${attentionCount}`],
+                  ['disabled', `已停用 ${disabledCredentialCount}`],
+                ] as [CredentialFilter, string][]).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    role="tab"
+                    aria-selected={filter === key}
+                    className={`rounded px-2.5 py-1 ${filter === key ? 'bg-secondary font-medium' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setFilter(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -824,33 +926,20 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
             <div className="flex gap-2">
               {selectedIds.size > 0 && (
                 <>
-                  {isPriorityMode && (
-                    <Button
-                      onClick={handlePrioritizeSelected}
-                      size="sm"
-                      variant="outline"
-                      disabled={prioritizing}
-                      title="将选中凭据优先级设为 0，其余凭据降级，立即生效"
-                    >
-                      <ArrowUpToLine className="h-4 w-4 mr-2" />
-                      {prioritizing ? '置顶中...' : '置顶优先'}
-                    </Button>
-                  )}
+                  <Button
+                    onClick={handlePrioritizeSelected}
+                    size="sm"
+                    variant="outline"
+                    disabled={prioritizing}
+                    title="将选中凭据优先级设为 0，其余凭据降级：请求只在选中凭据之间分配"
+                  >
+                    <ArrowUpToLine className="h-4 w-4 mr-2" />
+                    {prioritizing ? '置顶中...' : '置顶优先'}
+                  </Button>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
                   </Button>
-                  {singleSelected && singleSelected.authMethod !== 'api_key' && (
-                    <Button
-                      onClick={() => setReloginTarget({ id: singleSelected.id, authMethod: singleSelected.authMethod })}
-                      size="sm"
-                      variant="outline"
-                      title="通过浏览器重新授权并更新 Token"
-                    >
-                      <KeyRound className="h-4 w-4 mr-2" />
-                      重新登录
-                    </Button>
-                  )}
                   <Button
                     onClick={handleBatchForceRefresh}
                     size="sm"
@@ -954,10 +1043,12 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
               </DropdownMenu>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+          {filteredCredentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
+                {allCredentials.length === 0
+                  ? '暂无凭据'
+                  : filter === 'attention' ? '没有需要处理的凭据' : '没有已停用的凭据'}
               </CardContent>
             </Card>
           ) : (
@@ -967,11 +1058,15 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
+                    focused={credential.id === focusedId}
                     onQueryBalance={handleQueryBalance}
                     selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
+                    onToggleSelect={toggleSelect}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    onRelogin={handleRelogin}
+                    onFocus={handleFocus}
+                    onUnfocus={handleResetPriorities}
                   />
                 ))}
               </div>
@@ -988,7 +1083,7 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（共 {filteredCredentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
@@ -1022,15 +1117,16 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
         onOpenChange={setIdcLoginOpen}
         onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
         mode={idcLoginMode}
+        defaultStartUrl={enterpriseIdc?.startUrl}
+        defaultRegion={enterpriseIdc?.authRegion}
       />
 
       <ReloginDialog
         open={reloginTarget !== null}
         onOpenChange={(open) => {
-          if (!open) setReloginTarget(null)
+          if (!open) setReloginTargetId(null)
         }}
-        credentialId={reloginTarget?.id ?? 0}
-        authMethod={reloginTarget?.authMethod ?? null}
+        credential={reloginTarget}
         onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
       />
 

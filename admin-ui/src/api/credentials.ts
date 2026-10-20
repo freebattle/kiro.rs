@@ -64,6 +64,14 @@ export async function setCredentialPriority(
   return data
 }
 
+// 批量设置优先级（一次请求、后端一次落盘）
+export async function setCredentialPriorities(
+  updates: { id: number; priority: number }[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/priorities', { updates })
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number

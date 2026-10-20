@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle, ExternalLink, Loader2 } from 'lucide-react'
+import { CheckCircle, Copy, ExternalLink, Loader2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -18,14 +18,19 @@ import {
   startIdcRelogin,
   startSocialRelogin,
 } from '@/api/credentials'
-import type { StartIdcLoginResponse, StartSocialLoginResponse } from '@/types/api'
+import type {
+  CredentialStatusItem,
+  StartIdcLoginResponse,
+  StartSocialLoginResponse,
+} from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+
+const BUILDER_ID_START_URL = 'https://view.awsapps.com/start'
 
 interface ReloginDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  credentialId: number
-  authMethod: string | null
+  credential: CredentialStatusItem | null
   onSuccess: () => void
 }
 
@@ -83,14 +88,19 @@ function getContinueUrl(result: { status: string; nextUrl?: string; next_url?: s
 export function ReloginDialog({
   open,
   onOpenChange,
-  credentialId,
-  authMethod,
+  credential,
   onSuccess,
 }: ReloginDialogProps) {
+  const credentialId = credential?.id ?? 0
+  const authMethod = credential?.authMethod ?? null
   const initialMethod: Method =
     authMethod === 'idc' || authMethod === 'builder-id' || authMethod === 'iam'
       ? 'idc'
       : 'social'
+  // 沿用凭据原有的 Start URL / 区域：企业 IdC 凭据重新登录必须走同一个 IAM Identity Center
+  const initialStartUrl = credential?.startUrl ?? ''
+  const initialRegion = credential?.authRegion ?? 'us-east-1'
+  const isEnterpriseIdc = !!initialStartUrl && initialStartUrl !== BUILDER_ID_START_URL
 
   const [method, setMethod] = useState<Method>(initialMethod)
   const [step, setStep] = useState<Step>('select')
@@ -100,8 +110,10 @@ export function ReloginDialog({
   const [nextUrl, setNextUrl] = useState('')
   const [socialSession, setSocialSession] = useState<StartSocialLoginResponse | null>(null)
   const [idcSession, setIdcSession] = useState<StartIdcLoginResponse | null>(null)
-  const [region, setRegion] = useState('us-east-1')
-  const [startUrl, setStartUrl] = useState('')
+  const [region, setRegion] = useState(initialRegion)
+  const [startUrl, setStartUrl] = useState(initialStartUrl)
+  const [editIdc, setEditIdc] = useState(false)
+  const [incognito, setIncognito] = useState(true)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isRemote = isRemoteAccess()
 
@@ -120,9 +132,21 @@ export function ReloginDialog({
       setIdcSession(null)
       setCallbackUrl('')
       setNextUrl('')
+      setStartUrl(initialStartUrl)
+      setRegion(initialRegion)
+      setEditIdc(false)
     }
     return () => clearPollTimer()
-  }, [open, initialMethod])
+  }, [open, initialMethod, initialStartUrl, initialRegion])
+
+  const copyText = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success(`${label}已复制`)
+    } catch {
+      toast.error('复制失败，请手动复制')
+    }
+  }
 
   const handleOpenChange = (v: boolean) => {
     if (!v) {
@@ -162,13 +186,14 @@ export function ReloginDialog({
     }, POLL_INTERVAL_MS)
   }
 
-  const scheduleIdcPoll = (sessionId: string) => {
+  // 设备授权按服务端给的 interval 轮询（通常 5s），过快会被 OIDC 返回 slow_down
+  const scheduleIdcPoll = (sessionId: string, intervalSec: number) => {
     clearPollTimer()
     pollTimerRef.current = setTimeout(async () => {
       try {
         const result = await pollIdcRelogin(credentialId, sessionId)
         if (result.status === 'pending') {
-          scheduleIdcPoll(sessionId)
+          scheduleIdcPoll(sessionId, intervalSec)
         } else if (result.status === 'success') {
           setStep('done')
           onSuccess()
@@ -179,9 +204,9 @@ export function ReloginDialog({
         }
       } catch (e) {
         toast.error('轮询失败：' + extractErrorMessage(e))
-        scheduleIdcPoll(sessionId)
+        scheduleIdcPoll(sessionId, intervalSec)
       }
-    }, POLL_INTERVAL_MS)
+    }, Math.max(intervalSec, 1) * 1000)
   }
 
   const handleStartSocial = async () => {
@@ -201,7 +226,7 @@ export function ReloginDialog({
 
   const handleStartIdc = async () => {
     if (!region.trim()) {
-      toast.error('请填写 Region')
+      toast.error('请填写 SSO 区域')
       return
     }
     setIsStarting(true)
@@ -213,8 +238,13 @@ export function ReloginDialog({
       setIdcSession(resp)
       setStep('waiting')
       const openUrl = resp.verificationUriComplete || resp.verificationUri
-      window.open(openUrl, '_blank')
-      scheduleIdcPoll(resp.sessionId)
+      if (incognito) {
+        // 浏览器无法用脚本打开无痕窗口：复制链接让用户在无痕窗口粘贴，避免误用当前已登录的账号
+        await copyText(openUrl, '验证链接')
+      } else {
+        window.open(openUrl, '_blank')
+      }
+      scheduleIdcPoll(resp.sessionId, resp.pollInterval)
     } catch (e) {
       toast.error('发起 IdC 重新登录失败：' + extractErrorMessage(e))
     } finally {
@@ -271,44 +301,98 @@ export function ReloginDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>重新登录 · 凭据 #{credentialId}</DialogTitle>
+          <DialogTitle>
+            重新登录 · {credential?.email || `凭据 #${credentialId}`}
+          </DialogTitle>
           <DialogDescription>
-            Token 失效时通过浏览器重新授权，更新该凭据的 refreshToken（不会新建凭据）
+            通过浏览器重新授权，原地更新该凭据的 Token（不新建凭据，优先级和统计保留）
           </DialogDescription>
         </DialogHeader>
 
         {step === 'select' && (
           <div className="space-y-4">
-            <div className="grid gap-2">
-              <button
-                type="button"
-                className={`rounded-lg border p-3 text-left ${method === 'social' ? 'border-primary bg-accent/50' : ''}`}
-                onClick={() => setMethod('social')}
-              >
-                <div className="font-medium">Social / 企业 SSO</div>
-                <div className="text-sm text-muted-foreground">Portal PKCE 登录（Google / GitHub / Azure AD）</div>
-              </button>
-              <button
-                type="button"
-                className={`rounded-lg border p-3 text-left ${method === 'idc' ? 'border-primary bg-accent/50' : ''}`}
-                onClick={() => setMethod('idc')}
-              >
-                <div className="font-medium">IdC 设备授权</div>
-                <div className="text-sm text-muted-foreground">Builder ID / 企业 IAM Identity Center</div>
-              </button>
-            </div>
+            {credential?.email && (
+              <div className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-sm dark:border-amber-900 dark:bg-amber-950/40">
+                请使用 <span className="font-medium">{credential.email}</span> 登录。
+                用其他账号授权会把该凭据替换成另一个账号。
+              </div>
+            )}
+
+            {method === 'idc' && !editIdc ? (
+              <div className="rounded-lg border p-3 text-sm space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">
+                    {isEnterpriseIdc ? 'Enterprise IAM Identity Center SSO' : 'AWS Builder ID'}
+                  </span>
+                  <button
+                    type="button"
+                    className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+                    onClick={() => setEditIdc(true)}
+                  >
+                    修改
+                  </button>
+                </div>
+                <div className="text-muted-foreground break-all">
+                  {startUrl || BUILDER_ID_START_URL} · {region}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-2">
+                  <button
+                    type="button"
+                    className={`rounded-lg border p-3 text-left ${method === 'idc' ? 'border-primary bg-accent/50' : ''}`}
+                    onClick={() => setMethod('idc')}
+                  >
+                    <div className="font-medium">IdC 设备授权</div>
+                    <div className="text-sm text-muted-foreground">企业 IAM Identity Center / Builder ID</div>
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-lg border p-3 text-left ${method === 'social' ? 'border-primary bg-accent/50' : ''}`}
+                    onClick={() => setMethod('social')}
+                  >
+                    <div className="font-medium">Social / 企业 SSO</div>
+                    <div className="text-sm text-muted-foreground">Portal PKCE 登录（Google / GitHub / Azure AD）</div>
+                  </button>
+                </div>
+
+                {method === 'idc' && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="relogin-start-url">SSO Start URL</label>
+                    <Input
+                      id="relogin-start-url"
+                      value={startUrl}
+                      onChange={(e) => setStartUrl(e.target.value)}
+                      placeholder={`留空使用 Builder ID（${BUILDER_ID_START_URL}）`}
+                    />
+                    <label className="text-sm font-medium" htmlFor="relogin-region">SSO 区域</label>
+                    <Input
+                      id="relogin-region"
+                      value={region}
+                      onChange={(e) => setRegion(e.target.value)}
+                      placeholder="ap-southeast-1"
+                    />
+                  </div>
+                )}
+              </>
+            )}
 
             {method === 'idc' && (
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Region</label>
-                <Input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="us-east-1" />
-                <label className="text-sm font-medium">Start URL（企业 IdC 可选）</label>
-                <Input
-                  value={startUrl}
-                  onChange={(e) => setStartUrl(e.target.value)}
-                  placeholder="留空使用 Builder ID 默认"
+              <label className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={incognito}
+                  onChange={(e) => setIncognito(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
                 />
-              </div>
+                <span className="text-sm">
+                  <span className="font-medium">用无痕窗口登录（推荐多账号时使用）</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    发起后自动复制验证链接，在无痕窗口（⌘+Shift+N）粘贴打开，避免浏览器沿用已登录的其他账号。
+                  </span>
+                </span>
+              </label>
             )}
 
             <DialogFooter>
@@ -334,18 +418,45 @@ export function ReloginDialog({
             </div>
 
             {method === 'idc' && idcSession && (
-              <div className="rounded-md border p-3 text-sm space-y-1">
-                <div>
-                  验证码：<span className="font-mono font-semibold">{idcSession.userCode}</span>
+              <div className="rounded-md border p-3 text-sm space-y-2">
+                {incognito && (
+                  <p className="text-muted-foreground">
+                    验证链接已复制，请在无痕窗口粘贴打开
+                    {credential?.email ? `，并用 ${credential.email} 登录` : ''}。
+                  </p>
+                )}
+                <div className="flex items-center gap-2">
+                  验证码：<span className="font-mono text-lg font-semibold tracking-widest">{idcSession.userCode}</span>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    onClick={() => copyText(idcSession.userCode, '验证码')}
+                    aria-label="复制验证码"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
                 </div>
-                <a
-                  href={idcSession.verificationUriComplete || idcSession.verificationUri}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center text-primary hover:underline"
-                >
-                  打开验证页面 <ExternalLink className="h-3 w-3 ml-1" />
-                </a>
+                <div className="flex flex-wrap gap-3">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      copyText(idcSession.verificationUriComplete || idcSession.verificationUri, '验证链接')
+                    }
+                  >
+                    <Copy className="h-3.5 w-3.5 mr-1" />
+                    复制验证链接
+                  </Button>
+                  <a
+                    href={idcSession.verificationUriComplete || idcSession.verificationUri}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center text-primary hover:underline"
+                  >
+                    在当前浏览器打开 <ExternalLink className="h-3 w-3 ml-1" />
+                  </a>
+                </div>
               </div>
             )}
 

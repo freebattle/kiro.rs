@@ -526,15 +526,37 @@ impl LoginService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        if req.region.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "缺少 SSO 区域（region）".to_string(),
+            ));
+        }
         self.start_idc_login_inner(req, None).await
     }
 
     pub async fn start_idc_relogin(
         &self,
         target_id: u64,
-        req: StartIdcLoginRequest,
+        mut req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
         self.ensure_credential_exists(target_id)?;
+        // 未显式指定时沿用凭据原来的 Start URL / 区域，避免企业 IdC 凭据误走 Builder ID
+        let snapshot = self.token_manager.snapshot();
+        if let Some(entry) = snapshot.entries.iter().find(|e| e.id == target_id) {
+            if req.start_url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                req.start_url = entry.start_url.clone();
+            }
+            if req.region.trim().is_empty() {
+                if let Some(region) = &entry.auth_region {
+                    req.region = region.clone();
+                }
+            }
+        }
+        if req.region.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "缺少 SSO 区域（region）".to_string(),
+            ));
+        }
         self.start_idc_login_inner(req, Some(target_id)).await
     }
 
@@ -571,24 +593,21 @@ impl LoginService {
             "Enterprise"
         };
 
-        let cred_template = if relogin_target_id.is_some() {
-            KiroCredentials::default()
-        } else {
-            // OIDC/SSO 区域只写入 authRegion，不写 region。
-            // 登录成功后 add_credential 会立即 ListAvailableProfiles 拿 profileArn；
-            // 后续 API 请求通过 profileArn 解析真实 api region。
-            KiroCredentials {
-                auth_method: Some("idc".to_string()),
-                provider: Some(provider.to_string()),
-                client_id: Some(reg.client_id.clone()),
-                client_secret: Some(reg.client_secret.clone()),
-                start_url: Some(start_url.to_string()),
-                auth_region: Some(req.region.clone()),
-                priority: req.priority,
-                email: req.email,
-                proxy_url: req.proxy_url,
-                ..Default::default()
-            }
+        // OIDC/SSO 区域只写入 authRegion，不写 region。
+        // 登录成功后 add_credential 会立即 ListAvailableProfiles 拿 profileArn；
+        // 后续 API 请求通过 profileArn 解析真实 api region。
+        // 重新登录也用这份模板：新 refreshToken 绑定新注册的 OIDC 客户端，需一并回写。
+        let cred_template = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some(provider.to_string()),
+            client_id: Some(reg.client_id.clone()),
+            client_secret: Some(reg.client_secret.clone()),
+            start_url: Some(start_url.to_string()),
+            auth_region: Some(req.region.clone()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
         };
 
         let session = IdcAuthSession {
@@ -670,10 +689,20 @@ impl LoginService {
                 self.idc_sessions.lock().remove(session_id);
 
                 if let Some(target_id) = relogin_target_id {
-                    if let Some(refresh_token) = token.refresh_token {
-                        self.do_relogin_update(target_id, refresh_token)
-                            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                    }
+                    let refresh_token = token.refresh_token.ok_or_else(|| {
+                        AdminServiceError::InternalError("IdC 登录未返回 refreshToken".to_string())
+                    })?;
+                    let expires_at = token
+                        .expires_in
+                        .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+                    self.do_idc_relogin_update(
+                        target_id,
+                        refresh_token,
+                        token.access_token,
+                        expires_at,
+                        cred_template,
+                    )
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
                     tracing::info!("IdC 重新登录成功，凭据 #{} Token 已更新", target_id);
                     return Ok(PollLoginResponse::Success {
                         credential_id: target_id,
@@ -714,6 +743,38 @@ impl LoginService {
         self.token_manager.set_disabled(target_id, true)?;
         self.token_manager
             .update_refresh_token(target_id, refresh_token, None, None)?;
+        self.token_manager.reset_and_enable(target_id)?;
+        Ok(())
+    }
+
+    fn do_idc_relogin_update(
+        &self,
+        target_id: u64,
+        refresh_token: String,
+        access_token: String,
+        expires_at: Option<String>,
+        template: KiroCredentials,
+    ) -> anyhow::Result<()> {
+        let (Some(client_id), Some(client_secret), Some(start_url), Some(auth_region)) = (
+            template.client_id,
+            template.client_secret,
+            template.start_url,
+            template.auth_region,
+        ) else {
+            anyhow::bail!("IdC 登录会话缺少客户端信息");
+        };
+        self.token_manager.set_disabled(target_id, true)?;
+        self.token_manager.update_idc_relogin(
+            target_id,
+            refresh_token,
+            Some(access_token),
+            expires_at,
+            client_id,
+            client_secret,
+            start_url,
+            auth_region,
+            template.provider.unwrap_or_else(|| "Enterprise".to_string()),
+        )?;
         self.token_manager.reset_and_enable(target_id)?;
         Ok(())
     }

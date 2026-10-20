@@ -10,8 +10,8 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPrioritiesRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -49,6 +49,27 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/priorities
+/// 批量设置优先级（置顶 / 重置优先级）
+pub async fn set_credential_priorities(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetPrioritiesRequest>,
+) -> impl IntoResponse {
+    let updates: Vec<(u64, u32)> = payload
+        .updates
+        .iter()
+        .map(|u| (u.id, u.priority))
+        .collect();
+    match state.service.set_priorities(&updates) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "已更新 {} 个凭据的优先级",
+            updates.len()
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

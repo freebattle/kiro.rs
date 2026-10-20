@@ -239,6 +239,8 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
+                self.token_manager
+                    .record_error(ctx.id, format!("{} {}", status, body));
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -432,6 +434,8 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
+                self.token_manager
+                    .record_error(ctx.id, format!("{} {}", status, body));
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!(

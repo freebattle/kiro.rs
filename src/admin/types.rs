@@ -62,6 +62,27 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 身份提供商（BuilderId / Enterprise / AzureAD 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// IdC Start URL（重新登录时预填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+    /// OIDC/SSO 区域（重新登录时预填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 订阅等级（由余额查询回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 额度用尽时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_exhausted_at: Option<String>,
+    /// 最近一次凭据相关错误（刷新失败 / 401 / 403）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// 最近一次错误时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -80,6 +101,21 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 批量修改优先级中的一项
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorityUpdate {
+    pub id: u64,
+    pub priority: u32,
+}
+
+/// 批量修改优先级请求（一次加锁、一次落盘）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPrioritiesRequest {
+    pub updates: Vec<PriorityUpdate>,
 }
 
 /// 添加凭据请求

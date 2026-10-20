@@ -25,9 +25,24 @@ export interface CredentialStatusItem {
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
-  disabledReason?: string
+  disabledReason?: DisabledReason
   endpoint: string
+  provider?: string
+  startUrl?: string
+  authRegion?: string
+  subscriptionTitle?: string
+  quotaExhaustedAt?: string
+  lastError?: string
+  lastErrorAt?: string
 }
+
+export type DisabledReason =
+  | 'Manual'
+  | 'TooManyFailures'
+  | 'TooManyRefreshFailures'
+  | 'QuotaExceeded'
+  | 'InvalidRefreshToken'
+  | 'InvalidConfig'
 
 // 余额响应
 export interface BalanceResponse {
@@ -91,6 +106,7 @@ export interface AddCredentialResponse {
 // ============ OAuth 登录授权 ============
 
 export interface StartIdcLoginRequest {
+  /** 重新登录时可留空，后端沿用凭据原有的 authRegion */
   region: string
   startUrl?: string
   priority?: number
